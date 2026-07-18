@@ -108,13 +108,13 @@ class AsrGui:
             self.root.drop_target_register("DND_Files")
             self.root.dnd_bind("<<Drop>>", self._on_drop)
         else:
-            self._log("⚠ tkinterdnd2 未安装，拖放功能不可用。使用 [添加视频] 按钮。")
+            self._log("⚠ tkinterdnd2 未安装，拖放功能不可用。使用 [添加视频/字幕] 按钮。")
 
         # --- periodic polling ---
         self._poll_logs()
         self._poll_gpu()
 
-        self._log("ASR Pipeline GUI 启动完成。拖入视频或点击 [添加视频] 开始。")
+        self._log("ASR Pipeline GUI 启动完成。拖入视频/SRT 字幕或点击 [添加视频/字幕] 开始。")
 
     # ------------------------------------------------------------------
     # Build config
@@ -153,7 +153,7 @@ class AsrGui:
     # ------------------------------------------------------------------
 
     def _build_video_list(self) -> None:
-        frame = ttk.LabelFrame(self.root, text="视频列表（拖拽文件到此处或点击下方按钮添加）", padding=5)
+        frame = ttk.LabelFrame(self.root, text="视频 / 字幕列表（拖拽视频或 SRT 文件到此处）", padding=5)
         frame.pack(fill="both", expand=True, padx=10, pady=(10, 0))
 
         # Treeview
@@ -177,7 +177,7 @@ class AsrGui:
         # Buttons
         btn_frame = ttk.Frame(frame)
         btn_frame.pack(fill="x", pady=(5, 0))
-        ttk.Button(btn_frame, text="➕ 添加视频", command=self._add_videos).pack(side="left", padx=2)
+        ttk.Button(btn_frame, text="➕ 添加视频 / 字幕", command=self._add_videos).pack(side="left", padx=2)
         ttk.Button(btn_frame, text="✖ 移除选中", command=self._remove_selected).pack(side="left", padx=2)
 
         btn_row2 = ttk.Frame(frame)
@@ -483,7 +483,7 @@ class AsrGui:
 
     def _start(self) -> None:
         if not self._video_paths:
-            messagebox.showwarning("无视频", "请先添加视频文件（拖入或点击 [添加视频]）。")
+            messagebox.showwarning("无文件", "请先添加视频或 SRT 字幕文件。")
             return
 
         # Collect output formats

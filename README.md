@@ -4,14 +4,16 @@
 
 ## 特性
 
-- **Tkinter 图形界面** — 拖拽视频、手动选择语言、实时日志、GPU 监控，零命令行操作
+- **Tkinter 图形界面** — 拖拽视频/SRT、选翻译语言、实时日志、GPU 监控，零命令行操作
 - **语言自动检测** — 默认自动识别视频语言，支持手动指定 14 种语言
 - **GPU 多路并行** — spawn 独立进程，每进程常驻一个 WhisperModel，并发数根据显存自动计算
 - **长视频自动切割** — 超过 N 分钟的音频自动切成片段，多 Worker 并行处理，最后合并时间戳
 - **断点续跑** — 中断后重跑自动跳过已完成的视频，进度持久化到 `.progress.json`
 - **字幕级切分** — SRT 输出按标点 + 时长切分为可读短句（2-7 秒 / 条，≤40 字）
 - **多种输出** — SRT 字幕（默认）+ TXT 纯文本 + MD 带时间轴，可选勾选
-- **全离线** — 模型本地加载，无网络依赖，零数据外泄
+- **免费翻译** — 基于 Edge API，零注册零 Key，14 种语言，输出 PotPlayer 兼容双语字幕
+- **SRT 直翻** — 已有 SRT 文件拖入即翻，跳过转写，秒级出结果
+- **全离线** — ASR 模型本地加载，无网络依赖，零数据外泄
 
 ## 硬件要求
 
@@ -65,22 +67,38 @@ git clone https://huggingface.co/deepdml/faster-whisper-large-v3-turbo-ct2
 
 ```bash
 uv run python -m src.gui
-# 或
-uv run src/gui.py
 ```
 
-拖入视频文件 → 点"开始转写" → 完成。
+1. 拖入视频文件（或直接拖入已有的 `.srt` 字幕）
+2. 在"翻译为"下拉选择目标语言（如中文 chs）
+3. 点"开始转写" → 自动完成转写 + 翻译，输出双语字幕
 
-### 命令行
+> **字幕直翻**：直接把 `.srt` 文件拖进窗口，选择翻译语言，点开始即可跳过转写、只做翻译。
+
+### 命令行 — 转写 + 翻译
 
 ```bash
-uv run python -m src.main --input . --output ./output
+# 仅转写
+uv run python -m src.main --input ./videos --output ./output
+
+# 转写并翻译为中文
+uv run python -m src.main --input ./videos --output ./output --translate zh
 
 # 输出结构：
 #   output/
-#   ├── demo1.srt             ← 标准 SRT 字幕
-#   ├── demo2.srt
+#   ├── demo1.srt             ← 原始 SRT 字幕
+#   ├── demo1.chs.srt         ← 中文双语字幕（PotPlayer 可自动加载）
 #   └── ...
+```
+
+### 命令行 — 仅翻译已有 SRT
+
+```bash
+# 翻译单个 SRT 文件
+uv run python -c "
+from src.translator import EdgeTranslator, translate_srt
+translate_srt('demo.srt', 'zh', provider=EdgeTranslator())
+"
 ```
 
 ## 命令行参数
@@ -99,6 +117,7 @@ uv run python -m src.main --input . --output ./output
 | `--compute-type` | str | `float16` | 推理精度：float16 / int8_float16 |
 | `--no-vad` | flag | false | 禁用 VAD 语音检测 |
 | `--no-cleanup` | flag | false | 保留临时音频文件 |
+| `--translate` | str | — | 翻译目标语言（如 zh / en / ko），不指定则不翻译 |
 | `--verbose` | flag | false | 输出 DEBUG 级日志 |
 | `--force` | flag | false | 忽略断点续跑，强制全部重跑 |
 
@@ -168,9 +187,21 @@ uv run python -m src.main --input ./videos --output ./subtitles --force
 ### 切换语言
 
 ```bash
-# 手动指定语言（默认自动检测）
+# 手动指定 ASR 识别语言（默认自动检测）
 uv run python -m src.main --input ./videos --output ./out --language en
 ```
+
+### 翻译字幕
+
+```bash
+# 转写后自动翻译为中文
+uv run python -m src.main --input ./videos --output ./out --translate zh
+
+# GUI 方式：拖入视频或 .srt 文件，选择"翻译为 → 中文(zh)"，点开始
+uv run python -m src.gui
+```
+
+> 翻译基于 Microsoft Edge API，免费、零注册、无需 API Key。支持 14 种目标语言，输出 PotPlayer 兼容的双语字幕（原名.chs.srt / .eng.srt 等）。
 
 ## 管线架构
 
