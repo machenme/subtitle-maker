@@ -228,6 +228,7 @@ class AsrGui:
             status = self._check_existing_subs(p)
             status_text = {"done": "已有字幕", "translate": "待翻译", "asr": "等待中"}[status]
         self._file_status[str(p)] = status
+        self._log(f"检测: {p.name} → {status}")
 
         dur_str = self._get_duration_str(p) if p.suffix.lower() != ".srt" else "—"
         self._tree.insert("", "end", iid=str(p), values=(p.name, dur_str, status_text))
@@ -591,6 +592,7 @@ class AsrGui:
                     break
 
                 status = self._file_status.get(str(file_path), "asr")
+                self._log(f"{file_path.name}: {status}")
                 self._progress_queue.put((0.0, i, total))
 
                 # --- "done": .chs.srt already exists → skip ---
