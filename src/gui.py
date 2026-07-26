@@ -371,6 +371,9 @@ class AsrGui:
                      values=list(self._translate_label_map.keys()),
                      width=11, state="readonly").pack(side="left", padx=5)
 
+        self._swap_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row4, text="译为主字幕", variable=self._swap_var).pack(side="left", padx=(15, 0))
+
     # ------------------------------------------------------------------
     # GPU status
     # ------------------------------------------------------------------
@@ -549,6 +552,7 @@ class AsrGui:
                 "chunk_duration": 0 if self._chunk_var.get() == "自动" else int(self._chunk_var.get()),
                 "output_formats": formats,
                 "translate_to": self._translate_label_map[self._translate_var.get()],
+                "swap_subtitles": self._swap_var.get(),
             })
         except Exception as exc:
             messagebox.showerror("配置错误", str(exc))

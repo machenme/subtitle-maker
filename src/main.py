@@ -179,6 +179,19 @@ def run_one_video(
             )
             written.append(translated_path)
 
+            # Swap: make translation the primary .srt, move original aside
+            if config.swap_subtitles and translated_path.exists():
+                from src.translator import iso_to_player_suffix
+                src_suffix = iso_to_player_suffix(
+                    config.language if config.language != "auto" else "ja"
+                )
+                original_renamed = srt_path.with_stem(f"{video_path.stem}.{src_suffix}")
+                srt_path.rename(original_renamed)
+                translated_path.rename(srt_path)
+                logger.info("Swapped subtitles: %s → %s, %s → %s",
+                            srt_path.name, original_renamed.name,
+                            translated_path.name, srt_path.name)
+
     # --- Cleanup temp audio for this video ---
     if config.cleanup_temp:
         _cleanup_temp_audio(wav_path)

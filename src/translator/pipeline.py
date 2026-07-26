@@ -8,29 +8,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-# ISO 639-1 → PotPlayer/VideoPlayer auto-load compatible suffix
-_PLAYER_LANG_SUFFIX: dict[str, str] = {
-    "zh": "chs",
-    "zh-hant": "cht",
-    "ja": "jpn",
-    "en": "eng",
-    "ko": "kor",
-    "fr": "fre",
-    "de": "ger",
-    "es": "spa",
-    "pt": "por",
-    "it": "ita",
-    "ru": "rus",
-    "ar": "ara",
-    "th": "tha",
-    "vi": "vie",
-}
-
 from src.translator.types import (
     SrtCue,
     TranslateConfig,
     TranslationError,
     TranslationProvider,
+    iso_to_player_suffix,
 )
 from src.translator.parser import parse_srt
 from src.translator.writer import write_bilingual_srt
@@ -152,7 +135,7 @@ def translate_srt(
             cues[cue_idx].translation = lines[j] if j < len(lines) else cues[cue_idx].text
 
     # --- 5. Write ---
-    suffix = _PLAYER_LANG_SUFFIX.get(target_lang, target_lang)
+    suffix = iso_to_player_suffix(target_lang)
     out = Path(output_path) if output_path else file_path.with_stem(
         f"{file_path.stem}.{suffix}"
     )

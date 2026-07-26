@@ -75,3 +75,30 @@ class TranslateConfig:
     max_workers: int = 2
     request_delay: float = 3.0   # seconds between batch submissions (Edge API rate-limit)
     token_ttl: int = 480         # seconds before token refresh
+
+
+# ---------------------------------------------------------------------------
+# ISO 639-1 → PotPlayer / video-player auto-load suffix
+# ---------------------------------------------------------------------------
+
+PLAYER_LANG_SUFFIX: dict[str, str] = {
+    "zh": "chs",
+    "zh-hant": "cht",
+    "ja": "jpn",
+    "en": "eng",
+    "ko": "kor",
+    "fr": "fre",
+    "de": "ger",
+    "es": "spa",
+    "pt": "por",
+    "it": "ita",
+    "ru": "rus",
+    "ar": "ara",
+    "th": "tha",
+    "vi": "vie",
+}
+
+
+def iso_to_player_suffix(iso: str) -> str:
+    """ISO 639-1 code → PotPlayer-compatible suffix (e.g. ``"ja"`` → ``"jpn"``)."""
+    return PLAYER_LANG_SUFFIX.get(iso, iso)
