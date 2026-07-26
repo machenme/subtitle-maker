@@ -26,7 +26,7 @@ from src.translator import EdgeTranslator, translate_srt
 from src.utils import scan_video_files
 from src.audio_extractor import AudioExtractor
 from src.gpu_scheduler import GpuScheduler
-from src.text_formatter import Segment, TextFormatter
+from src.text_formatter import Segment, TextFormatter, set_cps_language
 from src.task_manager import TaskManager
 from src.monitor import GpuMonitor
 
@@ -156,6 +156,7 @@ def run_one_video(
 
     video_out_dir = output_dir
     video_out_dir.mkdir(parents=True, exist_ok=True)
+    set_cps_language(config.language if config.language != "auto" else "ja")
     written = formatter.write_all(
         segments,
         base_path=video_out_dir / video_path.stem,

@@ -20,8 +20,24 @@ _SENTENCE_END = re.compile(r"[。！？!?\n]")
 _MAX_CHARS_PER_SUB = 40
 # Max seconds a single subtitle should stay on screen
 _MAX_SUB_DURATION = 7.0
-# Minimum characters-per-second for readability (CJK ~15-20, here 18)
-_MIN_CPS = 18
+# Characters-per-second by language (reading speed model)
+# zh: Chinese   ja: Japanese   en: English
+_CPS_BY_LANG: dict[str, int] = {"zh": 15, "ja": 10, "en": 17, "ko": 12}
+_DEFAULT_CPS = 18
+
+
+_cps_language = "ja"  # set by pipeline config
+
+
+def set_cps_language(lang: str) -> None:
+    """Set language code for CPS calculation (called before formatting)."""
+    global _cps_language
+    _cps_language = lang if lang in _CPS_BY_LANG else "ja"
+
+
+def _cps_for_lang(lang: str) -> int:
+    """Return recommended CPS for *lang* (ISO 639-1)."""
+    return _CPS_BY_LANG.get(lang, _DEFAULT_CPS)
 
 
 def _split_by_length(text: str, t_start: float, t_end: float) -> list[Segment]:
@@ -89,8 +105,8 @@ def _split_by_char_count_with_time(
     for chunk in chunks:
         # Proportional duration from original timing
         chunk_dur = (len(chunk) / total) * dur
-        # Enforce minimum readable time (CPS)
-        min_dur = len(chunk) / _MIN_CPS
+        # Enforce minimum readable time (CPS, language-adaptive)
+        min_dur = len(chunk) / _cps_for_lang(_cps_language)
         chunk_dur = max(chunk_dur, min_dur)
         # Cap
         chunk_dur = min(chunk_dur, _MAX_SUB_DURATION)

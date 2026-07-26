@@ -48,7 +48,7 @@ ffmpeg -version
 cd video-to-text
 uv python pin 3.11          # 固定 Python 3.11
 uv venv                      # 创建虚拟环境
-uv pip install -r requirements.txt
+uv sync
 ```
 
 ### 3. 下载模型
@@ -307,8 +307,8 @@ video-to-text/
 │   ├── {video_name}.srt
 │   └── ...
 ├── config.yaml              # 默认配置
-├── requirements.txt         # Python 依赖
 ├── pyproject.toml           # uv 项目配置
+├── uv.lock                  # 锁定的依赖版本（可复现构建）
 ├── .gitignore
 └── README.md
 ```

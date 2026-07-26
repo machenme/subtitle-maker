@@ -60,6 +60,15 @@ class TranslationProvider(Protocol):
         """
         ...
 
+    def translate_batch(
+        self, texts: list[str], source_lang: str = "auto", target_lang: str = "zh"
+    ) -> list[str]:
+        """Translate multiple texts at once (placeholder for future LLM).
+
+        Default: delegates to :meth:`translate` one-by-one.
+        """
+        ...
+
 
 # ---------------------------------------------------------------------------
 # Translation configuration

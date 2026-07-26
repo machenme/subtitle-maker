@@ -145,6 +145,12 @@ class EdgeTranslator:
 
         raise last_exc or TranslationError("Edge translate failed after retries")
 
+    def translate_batch(
+        self, texts: list[str], source_lang: str = "auto", target_lang: str = "zh"
+    ) -> list[str]:
+        """Batch translate (default: one-by-one via :meth:`translate`)."""
+        return [self.translate(t, source_lang, target_lang) for t in texts]
+
     # ------------------------------------------------------------------
     # Token management
     # ------------------------------------------------------------------

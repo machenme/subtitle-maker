@@ -47,13 +47,22 @@ def detect_optimal_workers(
 
         free_gb = mem.free / (1024 ** 3)
 
-        # Optional: probe actual model cost
+        # Optional: probe / cache actual model cost
         cost_gb = model_memory_gb
         if model_path:
-            from pathlib import Path
-            if Path(model_path).exists():
-                cost_gb = _probe_model_vram_cost(str(model_path), gpu_index)
-                cost_gb = cost_gb or model_memory_gb  # fallback
+            from pathlib import Path as _Path
+            p = _Path(model_path)
+            if p.exists():
+                cached = _read_gpu_cache()
+                cache_key = f"{p.resolve()}:float16"
+                if cache_key in cached:
+                    cost_gb = cached[cache_key]
+                else:
+                    probed = _probe_model_vram_cost(str(model_path), gpu_index)
+                    if probed:
+                        cost_gb = probed
+                        cached[cache_key] = round(probed, 2)
+                        _write_gpu_cache(cached)
 
         # 1.2x buffer to avoid OOM from transient allocations
         workers = int(free_gb / (cost_gb * 1.2))
@@ -125,6 +134,30 @@ def _probe_model_vram_cost(model_path: str, gpu_index: int = 0) -> float | None:
             return None
     except Exception:
         return None
+
+
+def _read_gpu_cache() -> dict[str, float]:
+    """Read ``.gpu_cache.json`` from cwd, return ``{model_path: vram_gb}``."""
+    import json as _json
+    try:
+        cache = _json.loads(Path(".gpu_cache.json").read_text(encoding="utf-8"))
+        return cache if isinstance(cache, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_gpu_cache(cache: dict[str, float]) -> None:
+    """Write ``.gpu_cache.json``."""
+    import json as _json
+    try:
+        Path(".gpu_cache.json").write_text(
+            _json.dumps(cache, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
 VALID_COMPUTE_TYPES = {"float16", "int8_float16", "int8"}
 DEFAULT_VIDEO_EXTENSIONS = ["mp4", "mkv", "mov", "avi", "flv", "wmv"]
 

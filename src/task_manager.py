@@ -20,13 +20,26 @@ _HEAD_TAIL_BYTES = 10 * 1024 * 1024  # 10 MB
 
 
 def _file_fingerprint(path: Path) -> dict | None:
-    """Return ``{size, mtime, head_hash}`` or None if file is unreadable."""
+    """Return ``{size, mtime, head_tail_hash, duration}`` or None."""
     try:
         stat = path.stat()
         size = stat.st_size
         mtime = int(stat.st_mtime)
+
+        dur = 0.0
+        try:
+            import subprocess as _sp
+            r = _sp.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "csv=p=0", str(path)],
+                capture_output=True, text=True, timeout=15,
+            )
+            dur = float(r.stdout.strip())
+        except Exception:
+            pass
+
         if size == 0:
-            return {"size": 0, "mtime": mtime, "head_hash": ""}
+            return {"size": 0, "mtime": mtime, "head_tail_hash": "", "duration": 0}
 
         h = hashlib.sha256()
         with open(path, "rb") as f:
@@ -34,7 +47,7 @@ def _file_fingerprint(path: Path) -> dict | None:
             if size > _HEAD_TAIL_BYTES * 2:
                 f.seek(-_HEAD_TAIL_BYTES, 2)
                 h.update(f.read(_HEAD_TAIL_BYTES))
-        return {"size": size, "mtime": mtime, "head_hash": h.hexdigest()}
+        return {"size": size, "mtime": mtime, "head_tail_hash": h.hexdigest(), "duration": round(dur, 1)}
     except OSError:
         return None
 
@@ -204,7 +217,8 @@ class TaskManager:
         return (
             stored.get("size") == current.get("size")
             and stored.get("mtime") == current.get("mtime")
-            and stored.get("head_hash") == current.get("head_hash")
+            and stored.get("head_tail_hash") == current.get("head_tail_hash")
+            and stored.get("duration") == current.get("duration")
         )
 
     # ------------------------------------------------------------------
