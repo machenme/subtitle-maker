@@ -37,6 +37,18 @@ logger = logging.getLogger(__name__)
 # Reusable pipeline function (used by both CLI and GUI)
 # ---------------------------------------------------------------------------
 
+def _cleanup_temp_audio(wav_path: Path) -> None:
+    """Remove WAV and its chunk directory.  Errors are silently ignored."""
+    import shutil as _shutil
+    try:
+        wav_path.unlink(missing_ok=True)
+        chunk_dir = wav_path.parent / f"{wav_path.stem}_chunks"
+        if chunk_dir.exists():
+            _shutil.rmtree(chunk_dir)
+    except OSError:
+        pass
+
+
 def run_one_video(
     config: PipelineConfig,
     video_path: Path,
@@ -83,6 +95,7 @@ def run_one_video(
         try:
             chunks = extractor.split_wav(wav_path, chunk_sec)
         except Exception as exc:
+            _cleanup_temp_audio(wav_path)
             return (False, 0, str(exc))
     else:
         chunks = [(0.0, wav_path)]
@@ -90,6 +103,7 @@ def run_one_video(
     logger.info(f"Audio ready: {len(chunks)} chunk(s)")
 
     if _check_cancelled():
+        _cleanup_temp_audio(wav_path)
         return (False, 0, "Cancelled after extraction")
 
     # --- Stage 2: GPU ASR ---
@@ -114,6 +128,7 @@ def run_one_video(
     gpu_monitor.stop()
 
     if _check_cancelled():
+        _cleanup_temp_audio(wav_path)
         return (False, 0, "Cancelled after transcription")
 
     # --- Stage 3: Merge & write ---
@@ -130,6 +145,7 @@ def run_one_video(
             all_done = False
 
     if not all_done or not chunk_results:
+        _cleanup_temp_audio(wav_path)
         return (False, 0, "Some chunks failed transcription")
 
     if len(chunk_results) > 1:
@@ -162,6 +178,10 @@ def run_one_video(
                 source_lang=config.language if config.language != "auto" else "auto",
             )
             written.append(translated_path)
+
+    # --- Cleanup temp audio for this video ---
+    if config.cleanup_temp:
+        _cleanup_temp_audio(wav_path)
 
     logger.info(
         f"✓ {video_path.stem}: {len(segments)} segments → "
