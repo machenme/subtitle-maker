@@ -4,6 +4,7 @@ and progress persistence to .progress.json.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from dataclasses import dataclass, field
@@ -13,6 +14,29 @@ from datetime import datetime, timezone
 from src.utils import output_exists_and_valid
 
 logger = logging.getLogger(__name__)
+
+# Read first + last N bytes for file fingerprint
+_HEAD_TAIL_BYTES = 10 * 1024 * 1024  # 10 MB
+
+
+def _file_fingerprint(path: Path) -> dict | None:
+    """Return ``{size, mtime, head_hash}`` or None if file is unreadable."""
+    try:
+        stat = path.stat()
+        size = stat.st_size
+        mtime = int(stat.st_mtime)
+        if size == 0:
+            return {"size": 0, "mtime": mtime, "head_hash": ""}
+
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            h.update(f.read(_HEAD_TAIL_BYTES))
+            if size > _HEAD_TAIL_BYTES * 2:
+                f.seek(-_HEAD_TAIL_BYTES, 2)
+                h.update(f.read(_HEAD_TAIL_BYTES))
+        return {"size": size, "mtime": mtime, "head_hash": h.hexdigest()}
+    except OSError:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -28,6 +52,7 @@ class Task:
     error_message: str | None = None
     started_at: str | None = None
     finished_at: str | None = None
+    fingerprint: dict | None = None  # {size, mtime, head_hash} at completion
 
 
 @dataclass
@@ -57,6 +82,7 @@ class TaskManager:
         self._progress_file = progress_file or (self._output_dir / ".progress.json")
         self._tasks: dict[str, Task] = {}       # keyed by video stem
         self._done_set: set[str] = set()
+        self._fingerprints: dict[str, dict] = {}  # stem → {size, mtime, head_hash}
 
     # ------------------------------------------------------------------
     # Build work queue
@@ -83,8 +109,13 @@ class TaskManager:
             self._tasks[stem] = task
 
             if not force and stem in self._done_set:
-                task.status = "done"
-                logger.info(f"Skip (already done): {stem}")
+                # Verify fingerprint: skip only if file hasn't changed
+                fp = _file_fingerprint(vp)
+                if fp and self._verify_fingerprint(stem, fp):
+                    task.status = "done"
+                    logger.info(f"Skip (already done): {stem}")
+                else:
+                    logger.info(f"File changed, re-processing: {stem}")
             else:
                 tasks.append(task)
 
@@ -130,15 +161,21 @@ class TaskManager:
         failed = [
             stem for stem, t in self._tasks.items() if t.status == "failed"
         ]
-        snap = ProgressSnapshot(
-            total=len(self._tasks),
-            completed=completed,
-            failed=failed,
-            updated_at=datetime.now(timezone.utc).isoformat(),
-        )
+        fingerprints = {
+            stem: t.fingerprint
+            for stem, t in self._tasks.items()
+            if t.fingerprint
+        }
+        snap = {
+            "total": len(self._tasks),
+            "completed": completed,
+            "failed": failed,
+            "fingerprints": fingerprints,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
         try:
             self._progress_file.write_text(
-                json.dumps(snap.__dict__, ensure_ascii=False, indent=2),
+                json.dumps(snap, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
         except OSError as exc:
@@ -150,10 +187,25 @@ class TaskManager:
             return None
         try:
             data = json.loads(self._progress_file.read_text(encoding="utf-8"))
+            # Load fingerprints (new field)
+            fps = data.pop("fingerprints", {})
+            if isinstance(fps, dict):
+                self._fingerprints.update(fps)
             return ProgressSnapshot(**data)
         except (json.JSONDecodeError, TypeError) as exc:
             logger.warning(f"Progress file corrupted, ignoring: {exc}")
             return None
+
+    def _verify_fingerprint(self, stem: str, current: dict) -> bool:
+        """True if *current* fingerprint matches the stored one for *stem*."""
+        stored = self._fingerprints.get(stem)
+        if not stored:
+            return False
+        return (
+            stored.get("size") == current.get("size")
+            and stored.get("mtime") == current.get("mtime")
+            and stored.get("head_hash") == current.get("head_hash")
+        )
 
     # ------------------------------------------------------------------
     # Task lifecycle
@@ -170,6 +222,7 @@ class TaskManager:
         if stem in self._tasks:
             self._tasks[stem].status = "done"
             self._tasks[stem].finished_at = datetime.now(timezone.utc).isoformat()
+            self._tasks[stem].fingerprint = _file_fingerprint(video_path)
 
     def mark_failed(self, video_path: Path, error: str) -> None:
         stem = video_path.stem

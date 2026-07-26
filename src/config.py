@@ -24,11 +24,17 @@ VALID_MODEL_SIZES = {"large-v3-turbo", "large-v3", "medium"}
 # GPU-aware worker count
 # ---------------------------------------------------------------------------
 
-def detect_optimal_workers(gpu_index: int = 0) -> int:
+def detect_optimal_workers(
+    gpu_index: int = 0,
+    model_memory_gb: float = 2.8,
+    model_path: str | None = None,
+) -> int:
     """
-    Query GPU total VRAM and compute recommended worker count.
+    Query GPU **free** VRAM and compute recommended worker count.
 
-    Formula: floor((VRAM_GB - 3) / 2.5), clamped to [1, 8].
+    If *model_path* is provided, probes actual model memory cost by loading
+    the model once and measuring VRAM delta.  Otherwise uses *model_memory_gb*
+    estimate (~2.8 GB for large-v3-turbo FP16).
 
     Returns 1 if GPU detection fails.
     """
@@ -39,11 +45,86 @@ def detect_optimal_workers(gpu_index: int = 0) -> int:
         mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
         pynvml.nvmlShutdown()
 
-        vram_gb = mem.total / (1024 ** 3)
-        workers = int((vram_gb - 3) / 2.5)
+        free_gb = mem.free / (1024 ** 3)
+
+        # Optional: probe actual model cost
+        cost_gb = model_memory_gb
+        if model_path:
+            from pathlib import Path
+            if Path(model_path).exists():
+                cost_gb = _probe_model_vram_cost(str(model_path), gpu_index)
+                cost_gb = cost_gb or model_memory_gb  # fallback
+
+        # 1.2x buffer to avoid OOM from transient allocations
+        workers = int(free_gb / (cost_gb * 1.2))
         return max(1, min(8, workers))
     except Exception:
         return 1
+
+
+def _probe_model_vram_cost(model_path: str, gpu_index: int = 0) -> float | None:
+    """Load the model once and return VRAM delta in GB (or None on failure)."""
+    try:
+        import logging as _logging
+        import threading as _threading
+        import multiprocessing as _mp
+        import queue as _queue
+
+        _log = _logging.getLogger(__name__)
+
+        ctx = _mp.get_context("spawn")
+        result_q: _mp.Queue = ctx.Queue()
+        stop = _threading.Event()
+
+        def _probe_worker(q, model_path, compute_type):
+            import os as _os, sys as _sys
+            # CUDA DLL setup (same as gpu_scheduler)
+            dll_dirs: set[str] = set()
+            for p in _sys.path:
+                nvidia_root = _os.path.join(p, "nvidia")
+                if not _os.path.isdir(nvidia_root):
+                    continue
+                for pkg in _os.listdir(nvidia_root):
+                    for sub in ("bin", "lib"):
+                        d = _os.path.join(nvidia_root, pkg, sub)
+                        if _os.path.isdir(d):
+                            _os.add_dll_directory(d)
+                            dll_dirs.add(d)
+            _path_parts = _os.environ.get("PATH", "").split(_os.pathsep)
+            _os.environ["PATH"] = _os.pathsep.join(sorted(dll_dirs) + _path_parts)
+
+            import pynvml as _pn
+            _pn.nvmlInit()
+            h = _pn.nvmlDeviceGetHandleByIndex(0)
+            before = _pn.nvmlDeviceGetMemoryInfo(h).used
+            _pn.nvmlShutdown()
+
+            try:
+                from faster_whisper import WhisperModel
+                WhisperModel(model_path, device="cuda", compute_type=compute_type)
+            except Exception as exc:
+                q.put(None)
+                return
+
+            _pn.nvmlInit()
+            h = _pn.nvmlDeviceGetHandleByIndex(0)
+            after = _pn.nvmlDeviceGetMemoryInfo(h).used
+            _pn.nvmlShutdown()
+            q.put((after - before) / (1024 ** 3))
+
+        p = ctx.Process(target=_probe_worker, args=(result_q, model_path, "float16"))
+        p.start()
+        p.join(timeout=120)
+        if p.is_alive():
+            p.terminate()
+            p.join()
+            return None
+        try:
+            return result_q.get(timeout=5)
+        except _queue.Empty:
+            return None
+    except Exception:
+        return None
 VALID_COMPUTE_TYPES = {"float16", "int8_float16", "int8"}
 DEFAULT_VIDEO_EXTENSIONS = ["mp4", "mkv", "mov", "avi", "flv", "wmv"]
 

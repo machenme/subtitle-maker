@@ -13,7 +13,7 @@ venv/
 .python-version
 
 # uv
-uv.lock
+# uv.lock — committed for reproducible builds
 
 # IDE
 .vscode/

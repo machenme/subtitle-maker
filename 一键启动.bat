@@ -1,1 +1,1 @@
-uv run .\src\gui.py
+uv run python -m src.gui

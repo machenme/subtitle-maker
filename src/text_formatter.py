@@ -14,12 +14,14 @@ from src.utils import format_timestamp
 # Subtitle split constants
 # ---------------------------------------------------------------------------
 
-# Japanese sentence-ending punctuation (splits here)
+# Japanese / CJK sentence-ending punctuation (splits here)
 _SENTENCE_END = re.compile(r"[。！？!?\n]")
-# Max characters per subtitle line (Japanese)
+# Max characters per subtitle line
 _MAX_CHARS_PER_SUB = 40
 # Max seconds a single subtitle should stay on screen
 _MAX_SUB_DURATION = 7.0
+# Minimum characters-per-second for readability (CJK ~15-20, here 18)
+_MIN_CPS = 18
 
 
 def _split_by_length(text: str, t_start: float, t_end: float) -> list[Segment]:
@@ -28,14 +30,53 @@ def _split_by_length(text: str, t_start: float, t_end: float) -> list[Segment]:
 
 
 def _split_by_char_count(text: str, max_chars: int) -> list[str]:
-    """Split a string into chunks of at most max_chars characters."""
-    return [text[i:i + max_chars] for i in range(0, len(text), max_chars)]
+    """Split text at semantic boundaries, falling back to char-based cuts."""
+    # Try semantic split first; fall back to fixed-length
+    chunks = _split_semantic(text, max_chars)
+    if not chunks:
+        return [text[i:i + max_chars] for i in range(0, len(text), max_chars)]
+    return chunks
+
+
+# Punctuation priority for semantic splitting (strong → weak)
+_SEMANTIC_SPLIT = re.compile(r"([。！？!?\n])")
+_SEMANTIC_SPLIT_MEDIUM = re.compile(r"([；;])")
+_SEMANTIC_SPLIT_WEAK = re.compile(r"([，,])")
+
+
+def _split_semantic(text: str, max_chars: int) -> list[str]:
+    """Greedy semantic split: accumulate chars until punctuation, split when
+    approaching *max_chars*.  Tries strong → medium → weak separators."""
+    if len(text) <= max_chars:
+        return [text]
+
+    # Find best split point within max_chars from the end
+    candidate = text[:max_chars]
+
+    # Try strong punctuation (。！？)
+    for m in reversed(list(_SEMANTIC_SPLIT.finditer(candidate))):
+        return [candidate[:m.end()]] + _split_semantic(text[m.end():], max_chars)
+
+    # Try medium punctuation (；)
+    for m in reversed(list(_SEMANTIC_SPLIT_MEDIUM.finditer(candidate))):
+        return [candidate[:m.end()]] + _split_semantic(text[m.end():], max_chars)
+
+    # Try weak punctuation (，)
+    for m in reversed(list(_SEMANTIC_SPLIT_WEAK.finditer(candidate))):
+        return [candidate[:m.end()]] + _split_semantic(text[m.end():], max_chars)
+
+    # No punctuation found — fall back to char-based
+    return []
 
 
 def _split_by_char_count_with_time(
     text: str, t_start: float, t_end: float, max_chars: int
 ) -> list[Segment]:
-    """Split text into subtitle-sized chunks and distribute timing proportionally."""
+    """Split text into subtitle-sized chunks and distribute timing.
+
+    Uses CPS (characters-per-second) to guarantee minimum readable display
+    time: each chunk gets at least ``len(chunk) / _MIN_CPS`` seconds.
+    """
     chunks = _split_by_char_count(text, max_chars)
     if not chunks:
         return []
@@ -46,7 +87,13 @@ def _split_by_char_count_with_time(
     results: list[Segment] = []
     t = t_start
     for chunk in chunks:
-        chunk_dur = min((len(chunk) / total) * dur, _MAX_SUB_DURATION)
+        # Proportional duration from original timing
+        chunk_dur = (len(chunk) / total) * dur
+        # Enforce minimum readable time (CPS)
+        min_dur = len(chunk) / _MIN_CPS
+        chunk_dur = max(chunk_dur, min_dur)
+        # Cap
+        chunk_dur = min(chunk_dur, _MAX_SUB_DURATION)
         chunk_end = min(t + chunk_dur, t_end)
         results.append(Segment(round(t, 3), round(chunk_end, 3), chunk.strip()))
         t = chunk_end
