@@ -22,7 +22,7 @@ import threading
 import time
 
 from src.config import PipelineConfig
-from src.translator import EdgeTranslator, translate_srt, TranslationError
+from src.translator import EdgeTranslator, translate_srt
 from src.utils import scan_video_files
 from src.audio_extractor import AudioExtractor
 from src.gpu_scheduler import GpuScheduler
@@ -154,17 +154,14 @@ def run_one_video(
             logger.info(
                 f"Translating SRT: {srt_path.name} → {config.translate_to}"
             )
-            try:
-                provider = EdgeTranslator()
-                translated_path = translate_srt(
-                    srt_path,
-                    config.translate_to,
-                    provider=provider,
-                    source_lang=config.language if config.language != "auto" else "auto",
-                )
-                written.append(translated_path)
-            except TranslationError as exc:
-                logger.error(f"Translation failed: {exc}")
+            provider = EdgeTranslator()
+            translated_path = translate_srt(
+                srt_path,
+                config.translate_to,
+                provider=provider,
+                source_lang=config.language if config.language != "auto" else "auto",
+            )
+            written.append(translated_path)
 
     logger.info(
         f"✓ {video_path.stem}: {len(segments)} segments → "

@@ -82,6 +82,7 @@ class AsrGui:
 
         # --- state ---
         self._video_paths: list[Path] = []
+        self._file_status: dict[str, str] = {}  # stem → "asr"|"translate"|"done"|"direct_srt"
         self._running = threading.Event()
         self._cancel = threading.Event()
         self._log_queue: queue.Queue = queue.Queue()
@@ -195,6 +196,22 @@ class AsrGui:
         for f in files:
             self._add_video(Path(f))
 
+    @staticmethod
+    def _check_existing_subs(video_path: Path) -> str:
+        """Check for existing subtitle files alongside *video_path*.
+
+        Returns:
+            ``"done"`` — .chs.srt exists.
+            ``"translate"`` — .srt exists but no .chs.srt.
+            ``"asr"`` — neither exists.
+        """
+        base = video_path.with_suffix("")
+        if Path(str(base) + ".chs.srt").exists():
+            return "done"
+        if Path(str(base) + ".srt").exists():
+            return "translate"
+        return "asr"
+
     def _add_video(self, p: Path) -> None:
         if p in self._video_paths:
             return
@@ -202,8 +219,18 @@ class AsrGui:
         if not self._video_paths:
             self._out_dir_var.set(str(p.parent))
         self._video_paths.append(p)
-        dur_str = self._get_duration_str(p)
-        self._tree.insert("", "end", iid=str(p), values=(p.name, dur_str, "等待中"))
+
+        # Auto-detect subtitle status
+        if p.suffix.lower() == ".srt":
+            status = "direct_srt"
+            status_text = "等待翻译"
+        else:
+            status = self._check_existing_subs(p)
+            status_text = {"done": "已有字幕", "translate": "待翻译", "asr": "等待中"}[status]
+        self._file_status[str(p)] = status
+
+        dur_str = self._get_duration_str(p) if p.suffix.lower() != ".srt" else "—"
+        self._tree.insert("", "end", iid=str(p), values=(p.name, dur_str, status_text))
 
     def _remove_selected(self) -> None:
         for sel in self._tree.selection():
@@ -211,10 +238,12 @@ class AsrGui:
             p = Path(sel)
             if p in self._video_paths:
                 self._video_paths.remove(p)
+            self._file_status.pop(str(p), None)
 
     def _clear_videos(self) -> None:
         self._tree.delete(*self._tree.get_children())
         self._video_paths.clear()
+        self._file_status.clear()
 
     def _on_drop(self, event) -> None:
         """Handle drag-and-drop of files."""
@@ -556,33 +585,38 @@ class AsrGui:
         done_count = 0
         start_time = time.time()
 
-        for i, file_path in enumerate(self._video_paths):
-            if self._cancel.is_set():
-                break
+        try:
+            for i, file_path in enumerate(self._video_paths):
+                if self._cancel.is_set():
+                    break
 
-            # Reset progress for this file
-            self._progress_queue.put((0.0, i, total))
+                status = self._file_status.get(str(file_path), "asr")
+                self._progress_queue.put((0.0, i, total))
 
-            is_srt = file_path.suffix.lower() == ".srt"
+                # --- "done": .chs.srt already exists → skip ---
+                if status == "done":
+                    self.root.after(0, lambda p=file_path: self._set_video_status(p, "已有字幕"))
+                    done_count += 1
+                    self._progress_queue.put((100.0, i, total))
+                    continue
 
-            if is_srt:
-                # --- SRT-only: skip ASR, translate directly ---
-                self.root.after(0, lambda p=file_path: self._set_video_status(p, "翻译中..."))
-                try:
+                # --- "translate" / "direct_srt": translate existing .srt ---
+                if status in ("translate", "direct_srt"):
+                    srt_path = file_path if status == "direct_srt" else file_path.with_suffix(".srt")
+                    target = config.translate_to if status == "direct_srt" else "zh"
+                    self.root.after(0, lambda p=file_path: self._set_video_status(p, "翻译中..."))
                     provider = EdgeTranslator()
                     translate_srt(
-                        file_path, config.translate_to,
+                        srt_path, target,
                         provider=provider,
                         source_lang="auto",
                     )
                     self.root.after(0, lambda p=file_path: self._set_video_status(p, "✅ 已翻译"))
                     done_count += 1
                     self._progress_queue.put((100.0, i, total))
-                except Exception as exc:
-                    self.root.after(0, lambda p=file_path, e=exc: self._set_video_status(p, f"❌ {str(e)[:30]}"))
-                    self._log(f"⚠ SRT 翻译失败: {file_path.name} — {exc}")
-            else:
-                # --- Video: full ASR pipeline ---
+                    continue
+
+                # --- "asr": full ASR pipeline ---
                 self.root.after(0, lambda p=file_path: self._set_video_status(p, "处理中..."))
 
                 ok, seg_count, err = run_one_video(
@@ -599,10 +633,12 @@ class AsrGui:
                 else:
                     self.root.after(0, lambda p=file_path, e=err: self._set_video_status(p, f"❌ {e[:30]}"))
 
-        elapsed = time.time() - start_time
+            elapsed = time.time() - start_time
+            self.root.after(0, self._pipeline_done, done_count, total, elapsed)
 
-        # Re-enable UI
-        self.root.after(0, self._pipeline_done, done_count, total, elapsed)
+        except TranslationError as exc:
+            self._log(f"❌ 翻译失败，已停止: {exc}")
+            self.root.after(0, self._pipeline_done, done_count, total, time.time() - start_time)
 
     def _set_video_status(self, video_path: Path, status: str) -> None:
         try:

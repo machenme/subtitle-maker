@@ -132,17 +132,17 @@ def translate_srt(
                 idx, lines = future.result()
                 results[idx] = lines
             except TranslationError:
-                failed_batches.append(batch_idx)
-                _, indices = batches[batch_idx]
-                results[batch_idx] = [texts[i] for i in indices]
+                # Cancel all pending futures and stop immediately
+                for f in futures:
+                    f.cancel()
+                raise
 
     elapsed = time.time() - start_time
     logger.info(
-        "Translation done in %.1fs (%d/%d batches ok)%s",
+        "Translation done in %.1fs (%d/%d batches ok)",
         elapsed,
-        len(batches) - len(failed_batches),
+        len(results),
         len(batches),
-        f", {len(failed_batches)} failed" if failed_batches else "",
     )
 
     # --- 4. Merge ---
