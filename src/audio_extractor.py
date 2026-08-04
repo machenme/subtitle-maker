@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import subprocess
 import logging
+import hashlib
 from pathlib import Path
 
 from src.utils import is_file_valid
@@ -50,7 +51,9 @@ class AudioExtractor:
         dest_dir = output_dir or self._temp_dir
         dest_dir.mkdir(parents=True, exist_ok=True)
 
-        wav_name = video_path.stem + ".wav"
+        source_key = str(video_path.resolve()).encode("utf-8")
+        source_hash = hashlib.sha1(source_key).hexdigest()[:10]
+        wav_name = f"{video_path.stem}.{source_hash}.wav"
         wav_path = dest_dir / wav_name
 
         # Skip if already extracted and valid
@@ -131,7 +134,7 @@ class AudioExtractor:
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
             return float(result.stdout.strip())
-        except (ValueError, subprocess.TimeoutExpired):
+        except (FileNotFoundError, OSError, ValueError, subprocess.TimeoutExpired):
             logger.warning(f"Could not determine duration for {path.name}, assuming 0")
             return 0.0
 

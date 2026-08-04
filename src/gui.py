@@ -37,7 +37,7 @@ import tkinter as tk
 from src.config import PipelineConfig, detect_optimal_workers
 from src.main import run_one_video
 from src.monitor import GpuMonitor
-from src.translator import EdgeTranslator, translate_srt, TranslationError
+from src.translator import EdgeTranslator, translate_srt, TranslationError, iso_to_player_suffix
 from src.utils import scan_video_files
 
 
@@ -79,6 +79,7 @@ class AsrGui:
         self.root.title("ASR Pipeline — 视频转字幕")
         self.root.geometry("900x700")
         self.root.minsize(700, 550)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # --- state ---
         self._video_paths: list[Path] = []
@@ -197,23 +198,35 @@ class AsrGui:
             self._add_video(Path(f))
 
     @staticmethod
-    def _check_existing_subs(video_path: Path) -> str:
+    def _check_existing_subs(
+        video_path: Path,
+        target_lang: str = "zh",
+        swap_subtitles: bool = True,
+    ) -> str:
         """Check for existing subtitle files alongside *video_path*.
 
         Returns:
-            ``"done"`` — .chs.srt exists.
-            ``"translate"`` — .srt exists but no .chs.srt.
+            ``"done"`` — the selected target subtitle exists.
+            ``"translate"`` — .srt exists but the target subtitle does not.
             ``"asr"`` — neither exists.
         """
         base = video_path.with_suffix("")
-        if Path(str(base) + ".chs.srt").exists():
+        target_path = Path(f"{base}.{iso_to_player_suffix(target_lang)}.srt")
+        if target_path.exists():
             return "done"
-        if Path(str(base) + ".srt").exists():
+        source_suffix = iso_to_player_suffix("ja")
+        swapped_source = Path(f"{base}.{source_suffix}.srt")
+        if swap_subtitles and swapped_source.exists() and Path(f"{base}.srt").exists():
+            return "done"
+        if Path(f"{base}.srt").exists():
             return "translate"
         return "asr"
 
     def _add_video(self, p: Path) -> None:
         if p in self._video_paths:
+            return
+        if any(existing.stem == p.stem for existing in self._video_paths):
+            self._log(f"⚠ 重名文件未添加，避免覆盖输出: {p.name}")
             return
         # First video added → default output dir to video's folder
         if not self._video_paths:
@@ -225,7 +238,11 @@ class AsrGui:
             status = "direct_srt"
             status_text = "等待翻译"
         else:
-            status = self._check_existing_subs(p)
+            status = self._check_existing_subs(
+                p,
+                self._translate_label_map.get(self._translate_var.get(), "zh"),
+                self._swap_var.get() if hasattr(self, "_swap_var") else True,
+            )
             status_text = {"done": "已有字幕", "translate": "待翻译", "asr": "等待中"}[status]
         self._file_status[str(p)] = status
         self._log(f"检测: {p.name} → {status}")
@@ -252,12 +269,14 @@ class AsrGui:
         raw = event.data
         # Strip braces from Windows DnD paths
         paths_str = raw.strip()
-        for line in paths_str.splitlines():
-            for part in line.split():
-                p = part.strip("{}")
-                path = Path(p)
-                if path.suffix.lower().lstrip(".") in {"mp4", "mkv", "mov", "avi", "flv", "wmv", "srt"}:
-                    self._add_video(path)
+        try:
+            dropped_paths = self.root.tk.splitlist(paths_str)
+        except tk.TclError:
+            dropped_paths = (paths_str.strip("{}"),)
+        for part in dropped_paths:
+            path = Path(part)
+            if path.suffix.lower().lstrip(".") in {"mp4", "mkv", "mov", "avi", "flv", "wmv", "srt"}:
+                self._add_video(path)
 
     def _on_double_click_video(self, event) -> None:
         sel = self._tree.selection()
@@ -531,9 +550,16 @@ class AsrGui:
             messagebox.showwarning("无输出格式", "请至少选择一种输出格式（SRT/TXT/MD）。")
             return
 
-        # SRT files require a translation target
-        has_srt = any(p.suffix.lower() == ".srt" for p in self._video_paths)
+        # Direct SRT files and videos with sidecar SRT files require a target.
+        has_srt = any(
+            p.suffix.lower() == ".srt"
+            or p.with_suffix(".srt").exists()
+            for p in self._video_paths
+        )
         translate_to = self._translate_label_map[self._translate_var.get()]
+        if translate_to and "srt" not in formats:
+            messagebox.showwarning("翻译需要 SRT", "启用翻译时必须勾选 SRT 输出。")
+            return
         if has_srt and not translate_to:
             messagebox.showwarning("需要翻译语言", "列表中有 SRT 文件，请选择翻译目标语言。")
             return
@@ -596,10 +622,16 @@ class AsrGui:
                     break
 
                 status = self._file_status.get(str(file_path), "asr")
+                if file_path.suffix.lower() != ".srt":
+                    status = self._check_existing_subs(
+                        file_path,
+                        config.translate_to or "zh",
+                        config.swap_subtitles,
+                    )
                 self._log(f"{file_path.name}: {status}")
                 self._progress_queue.put((0.0, i, total))
 
-                # --- "done": .chs.srt already exists → skip ---
+                # --- "done": target subtitle already exists → skip ---
                 if status == "done":
                     self.root.after(0, lambda p=file_path: self._set_video_status(p, "已有字幕"))
                     done_count += 1
@@ -609,7 +641,7 @@ class AsrGui:
                 # --- "translate" / "direct_srt": translate existing .srt ---
                 if status in ("translate", "direct_srt"):
                     srt_path = file_path if status == "direct_srt" else file_path.with_suffix(".srt")
-                    target = config.translate_to if status == "direct_srt" else "zh"
+                    target = config.translate_to
                     self.root.after(0, lambda p=file_path: self._set_video_status(p, "翻译中..."))
                     provider = EdgeTranslator()
                     translate_srt(
@@ -644,7 +676,11 @@ class AsrGui:
 
         except TranslationError as exc:
             self._log(f"❌ 翻译失败，已停止: {exc}")
-            self.root.after(0, self._pipeline_done, done_count, total, time.time() - start_time)
+            self.root.after(0, self._pipeline_done, done_count, total, time.time() - start_time, True)
+        except Exception as exc:
+            logger.exception("GUI pipeline failed")
+            self._log(f"❌ 处理失败，已停止: {exc}")
+            self.root.after(0, self._pipeline_done, done_count, total, time.time() - start_time, True)
 
     def _set_video_status(self, video_path: Path, status: str) -> None:
         try:
@@ -652,19 +688,29 @@ class AsrGui:
         except Exception:
             pass
 
-    def _pipeline_done(self, done: int, total: int, elapsed: float) -> None:
+    def _pipeline_done(
+        self, done: int, total: int, elapsed: float, failed: bool = False
+    ) -> None:
         self._running.clear()
         self._start_btn.configure(state="normal")
         self._stop_btn.configure(state="disabled")
         self._progress["value"] = 100
         self._progress_label.configure(text="100.00%")
         self._file_counter_label.configure(text="")
-        self._status_var.set(f"✅ 完成: {done}/{total}  (耗时 {elapsed:.0f}s)")
+        prefix = "❌ 停止" if failed else "✅ 完成"
+        self._status_var.set(f"{prefix}: {done}/{total}  (耗时 {elapsed:.0f}s)")
 
         # Open output folder
         out_dir = self._out_dir_var.get()
         if Path(out_dir).exists():
             self._log(f"输出目录: {out_dir}")
+
+    def _on_close(self) -> None:
+        """Stop background activity before destroying the Tk window."""
+        self._cancel.set()
+        if self._gpu_monitor:
+            self._gpu_monitor.stop()
+        self.root.destroy()
 
     # ------------------------------------------------------------------
     # Run

@@ -20,6 +20,11 @@ DEFAULT_MODEL_PATH = "./models/faster-whisper-large-v3-turbo-ct2"
 VALID_MODEL_SIZES = {"large-v3-turbo", "large-v3", "medium"}
 
 
+def _default_model_path(model_size: str) -> str:
+    """Return the conventional local model directory for a model size."""
+    return f"./models/faster-whisper-{model_size}-ct2"
+
+
 # ---------------------------------------------------------------------------
 # GPU-aware worker count
 # ---------------------------------------------------------------------------
@@ -71,62 +76,66 @@ def detect_optimal_workers(
         return 1
 
 
+def _probe_worker(q, model_path: str, gpu_index: int, compute_type: str) -> None:
+    """Child-process entry point for model VRAM probing on spawn platforms."""
+    import os as _os
+    import sys as _sys
+
+    dll_dirs: set[str] = set()
+    for path_entry in _sys.path:
+        nvidia_root = _os.path.join(path_entry, "nvidia")
+        if not _os.path.isdir(nvidia_root):
+            continue
+        for package in _os.listdir(nvidia_root):
+            for subdir in ("bin", "lib"):
+                directory = _os.path.join(nvidia_root, package, subdir)
+                if _os.path.isdir(directory):
+                    _os.add_dll_directory(directory)
+                    dll_dirs.add(directory)
+    path_parts = _os.environ.get("PATH", "").split(_os.pathsep)
+    _os.environ["PATH"] = _os.pathsep.join(sorted(dll_dirs) + path_parts)
+
+    import pynvml
+
+    try:
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_index)
+        before = pynvml.nvmlDeviceGetMemoryInfo(handle).used
+        pynvml.nvmlShutdown()
+
+        from faster_whisper import WhisperModel
+        WhisperModel(model_path, device="cuda", compute_type=compute_type)
+
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_index)
+        after = pynvml.nvmlDeviceGetMemoryInfo(handle).used
+        pynvml.nvmlShutdown()
+        q.put((after - before) / (1024 ** 3))
+    except Exception:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+        q.put(None)
+
+
 def _probe_model_vram_cost(model_path: str, gpu_index: int = 0) -> float | None:
     """Load the model once and return VRAM delta in GB (or None on failure)."""
+    import multiprocessing as _mp
+    import queue as _queue
+
     try:
-        import logging as _logging
-        import threading as _threading
-        import multiprocessing as _mp
-        import queue as _queue
-
-        _log = _logging.getLogger(__name__)
-
         ctx = _mp.get_context("spawn")
         result_q: _mp.Queue = ctx.Queue()
-        stop = _threading.Event()
-
-        def _probe_worker(q, model_path, compute_type):
-            import os as _os, sys as _sys
-            # CUDA DLL setup (same as gpu_scheduler)
-            dll_dirs: set[str] = set()
-            for p in _sys.path:
-                nvidia_root = _os.path.join(p, "nvidia")
-                if not _os.path.isdir(nvidia_root):
-                    continue
-                for pkg in _os.listdir(nvidia_root):
-                    for sub in ("bin", "lib"):
-                        d = _os.path.join(nvidia_root, pkg, sub)
-                        if _os.path.isdir(d):
-                            _os.add_dll_directory(d)
-                            dll_dirs.add(d)
-            _path_parts = _os.environ.get("PATH", "").split(_os.pathsep)
-            _os.environ["PATH"] = _os.pathsep.join(sorted(dll_dirs) + _path_parts)
-
-            import pynvml as _pn
-            _pn.nvmlInit()
-            h = _pn.nvmlDeviceGetHandleByIndex(0)
-            before = _pn.nvmlDeviceGetMemoryInfo(h).used
-            _pn.nvmlShutdown()
-
-            try:
-                from faster_whisper import WhisperModel
-                WhisperModel(model_path, device="cuda", compute_type=compute_type)
-            except Exception as exc:
-                q.put(None)
-                return
-
-            _pn.nvmlInit()
-            h = _pn.nvmlDeviceGetHandleByIndex(0)
-            after = _pn.nvmlDeviceGetMemoryInfo(h).used
-            _pn.nvmlShutdown()
-            q.put((after - before) / (1024 ** 3))
-
-        p = ctx.Process(target=_probe_worker, args=(result_q, model_path, "float16"))
-        p.start()
-        p.join(timeout=120)
-        if p.is_alive():
-            p.terminate()
-            p.join()
+        process = ctx.Process(
+            target=_probe_worker,
+            args=(result_q, model_path, gpu_index, "float16"),
+        )
+        process.start()
+        process.join(timeout=120)
+        if process.is_alive():
+            process.terminate()
+            process.join()
             return None
         try:
             return result_q.get(timeout=5)
@@ -175,7 +184,7 @@ class PipelineConfig:
     beam_size: int = 5
     vad_filter: bool = True
     compute_type: str = "float16"
-    max_workers: int = 4
+    max_workers: int = 5
     chunk_duration: int = 0  # seconds; 0 = auto (split evenly by worker count)
     video_extensions: list[str] = field(default_factory=lambda: DEFAULT_VIDEO_EXTENSIONS.copy())
     output_formats: list[str] = field(default_factory=lambda: ["srt"])
@@ -230,12 +239,19 @@ class PipelineConfig:
         output_dir = _resolve_path("output_dir") or (config_dir / "output")
         temp_dir = _resolve_path("temp_dir")  # may be None
 
-        model_path = cli.get("model_path") or raw.get("model_path") or DEFAULT_MODEL_PATH
+        model_size = cli.get("model") or raw.get("model_size") or "large-v3-turbo"
+        explicit_model_path = cli.get("model_path") or raw.get("model_path")
+        # A model selected from CLI/GUI should select its conventional model
+        # directory unless the caller supplied a custom path explicitly.
+        if cli.get("model") and not cli.get("model_path"):
+            raw_default = raw.get("model_path")
+            if raw_default in (None, DEFAULT_MODEL_PATH, _default_model_path("large-v3-turbo")):
+                explicit_model_path = _default_model_path(model_size)
+        model_path = explicit_model_path or DEFAULT_MODEL_PATH
         model_path = Path(model_path)
         if not model_path.is_absolute():
             model_path = (config_dir / model_path).resolve()
 
-        model_size = cli.get("model") or raw.get("model_size") or "large-v3-turbo"
         language = cli.get("language") or raw.get("language") or "auto"
         beam_size = int(cli.get("beam_size") or raw.get("beam_size") or 5)
         vad_filter = cli.get("vad_filter", raw.get("vad_filter", True))
@@ -297,6 +313,8 @@ class PipelineConfig:
         unknown = set(self.output_formats) - valid_formats
         if unknown:
             errors.append(f"Invalid output_formats: {unknown}. Valid: {valid_formats}")
+        if self.translate_to and "srt" not in self.output_formats:
+            errors.append("translate_to requires 'srt' in output_formats")
 
         if errors:
             raise ValueError("Configuration errors:\n  - " + "\n  - ".join(errors))

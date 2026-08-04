@@ -164,14 +164,6 @@ class TextFormatter:
                 result.append(seg)
                 continue
 
-            # Split on sentence boundaries
-            parts = _SENTENCE_END.split(seg.text)
-            # Keep the delimiter with the preceding text
-            sentences: list[str] = []
-            for match in _SENTENCE_END.finditer(seg.text):
-                # This is a bit tricky — we need to find actual sentence boundaries
-                pass
-
             # Simpler: find all positions of sentence-ending punctuation
             boundaries: list[int] = []
             text = seg.text
@@ -335,10 +327,12 @@ class TextFormatter:
         for seg in all_segments:
             if merged and seg.start < merged[-1].end:
                 # Actual time overlap — merge into previous
+                previous_duration = merged[-1].end - merged[-1].start
+                current_duration = seg.end - seg.start
                 merged[-1].end = max(merged[-1].end, seg.end)
                 # If the overlap is substantial, the text is likely duplicate;
                 # keep the longer version to avoid double text.
-                if seg.end - seg.start > merged[-1].end - merged[-1].start:
+                if current_duration > previous_duration:
                     merged[-1].text = seg.text
                 merged[-1].avg_logprob = max(merged[-1].avg_logprob, seg.avg_logprob)
             else:

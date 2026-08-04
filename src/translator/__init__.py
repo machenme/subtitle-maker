@@ -6,7 +6,7 @@ Public API
 - :func:`translate_srt` — one-shot SRT translation (parse → translate → write).
 - :func:`parse_srt` — parse an SRT file into :class:`SrtCue` list.
 - :func:`write_bilingual_srt` — write bilingual SRT from cue list.
-- :class:`EdgeTranslator` — Microsoft Edge API backend.
+- :class:`EdgeTranslator` — Bing Translator web backend (legacy class name).
 - :class:`TranslateConfig` — batch-tuning configuration.
 - :class:`SrtCue` — parsed subtitle entry.
 - :class:`TranslationError` — unrecoverable translation failure.

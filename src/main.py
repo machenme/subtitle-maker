@@ -28,7 +28,6 @@ from src.audio_extractor import AudioExtractor
 from src.gpu_scheduler import GpuScheduler
 from src.text_formatter import Segment, TextFormatter, set_cps_language
 from src.task_manager import TaskManager
-from src.monitor import GpuMonitor
 
 logger = logging.getLogger(__name__)
 
@@ -107,9 +106,6 @@ def run_one_video(
         return (False, 0, "Cancelled after extraction")
 
     # --- Stage 2: GPU ASR ---
-    gpu_monitor = GpuMonitor(gpu_index=0, interval=1.0)
-    gpu_monitor.start()
-
     scheduler_tasks = [(cp, video_path) for _, cp in chunks]
     scheduler = GpuScheduler(config)
     start_time = time.time()
@@ -117,15 +113,19 @@ def run_one_video(
     if progress_callback:
         progress_callback("transcribing", 0, len(scheduler_tasks))
 
-    raw_results = scheduler.process(
-        scheduler_tasks,
-        progress_callback=lambda received, total: (
-            progress_callback("transcribing", received, total)
-            if progress_callback else None
-        ),
-    )
+    try:
+        raw_results = scheduler.process(
+            scheduler_tasks,
+            progress_callback=lambda received, total: (
+                progress_callback("transcribing", received, total)
+                if progress_callback else None
+            ),
+        )
+    except Exception:
+        if config.cleanup_temp:
+            _cleanup_temp_audio(wav_path)
+        raise
     elapsed = time.time() - start_time
-    gpu_monitor.stop()
 
     if _check_cancelled():
         _cleanup_temp_audio(wav_path)
@@ -157,17 +157,19 @@ def run_one_video(
     video_out_dir = output_dir
     video_out_dir.mkdir(parents=True, exist_ok=True)
     set_cps_language(config.language if config.language != "auto" else "ja")
-    written = formatter.write_all(
-        segments,
-        base_path=video_out_dir / video_path.stem,
-        formats=config.output_formats,
-    )
+    try:
+        written = formatter.write_all(
+            segments,
+            base_path=video_out_dir / video_path.stem,
+            formats=config.output_formats,
+        )
 
-    # --- Stage 3b: Translation (optional) ---
-    translated_path: Path | None = None
-    if config.translate_to:
-        srt_path = video_out_dir / f"{video_path.stem}.srt"
-        if srt_path.exists():
+        # --- Stage 3b: Translation (optional) ---
+        translated_path: Path | None = None
+        if config.translate_to:
+            srt_path = video_out_dir / f"{video_path.stem}.srt"
+            if not srt_path.exists():
+                raise ValueError("Translation requires SRT output")
             logger.info(
                 f"Translating SRT: {srt_path.name} → {config.translate_to}"
             )
@@ -187,11 +189,17 @@ def run_one_video(
                     config.language if config.language != "auto" else "ja"
                 )
                 original_renamed = srt_path.with_stem(f"{video_path.stem}.{src_suffix}")
+                if original_renamed.exists():
+                    original_renamed.unlink()
                 srt_path.rename(original_renamed)
                 translated_path.rename(srt_path)
                 logger.info("Swapped subtitles: %s → %s, %s → %s",
                             srt_path.name, original_renamed.name,
                             translated_path.name, srt_path.name)
+    except Exception:
+        if config.cleanup_temp:
+            _cleanup_temp_audio(wav_path)
+        raise
 
     # --- Cleanup temp audio for this video ---
     if config.cleanup_temp:
@@ -275,18 +283,23 @@ def main():
     # --- Build config ---
     cli_dict = {
         "config": cli.config,
+        "input_dir": cli.input,
+        "output_dir": cli.output,
         "model": cli.model,
         "workers": cli.workers,
         "temp_dir": cli.temp_dir,
         "language": cli.language,
         "beam_size": cli.beam_size,
-        "vad_filter": not cli.no_vad,
         "compute_type": cli.compute_type,
         "chunk_duration": cli.chunk_duration,
         "translate_to": cli.translate,
-        "cleanup_temp": not cli.no_cleanup,
-        "verbose": cli.verbose,
     }
+    if cli.no_vad:
+        cli_dict["vad_filter"] = False
+    if cli.no_cleanup:
+        cli_dict["cleanup_temp"] = False
+    if cli.verbose:
+        cli_dict["verbose"] = True
     # Clean None values so they don't override YAML defaults
     cli_dict = {k: v for k, v in cli_dict.items() if v is not None}
 
@@ -314,8 +327,23 @@ def main():
 
     logger.info(f"Found {len(video_paths)} video(s)")
 
+    stems = [path.stem for path in video_paths]
+    duplicates = sorted({stem for stem in stems if stems.count(stem) > 1})
+    if duplicates:
+        logger.error(
+            "Duplicate video stems would overwrite outputs: "
+            + ", ".join(duplicates)
+        )
+        sys.exit(1)
+
     # --- Task manager (resume checkpoint) ---
-    task_mgr = TaskManager(config.output_dir)
+    task_mgr = TaskManager(
+        config.output_dir,
+        output_formats=config.output_formats,
+        translate_to=config.translate_to,
+        swap_subtitles=config.swap_subtitles,
+        source_lang=config.language,
+    )
     tasks = task_mgr.build_queue(video_paths, force=cli.force)
     if not tasks:
         logger.info("All videos already processed. Nothing to do.")
@@ -331,7 +359,11 @@ def main():
         if _shutdown_requested:
             break
         task_mgr.mark_started(task.video_path)
-        ok, seg_count, err = run_one_video(config, task.video_path)
+        try:
+            ok, seg_count, err = run_one_video(config, task.video_path)
+        except Exception as exc:
+            logger.exception("Unhandled pipeline error for %s", task.video_path.name)
+            ok, seg_count, err = False, 0, str(exc)
         if ok:
             task_mgr.mark_done(task.video_path)
             total_segments += seg_count

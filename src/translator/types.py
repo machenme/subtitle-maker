@@ -82,8 +82,18 @@ class TranslateConfig:
     source_lang: str = "auto"
     batch_size: int = 50
     max_workers: int = 2
-    request_delay: float = 3.0   # seconds between batch submissions (Edge API rate-limit)
+    request_delay: float = 3.0   # seconds between batch submissions (Bing rate-limit)
     token_ttl: int = 480         # seconds before token refresh
+
+    def __post_init__(self) -> None:
+        if self.batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
+        if self.max_workers < 1:
+            raise ValueError("max_workers must be >= 1")
+        if self.request_delay < 0:
+            raise ValueError("request_delay must be >= 0")
+        if self.token_ttl < 60:
+            raise ValueError("token_ttl must be >= 60")
 
 
 # ---------------------------------------------------------------------------

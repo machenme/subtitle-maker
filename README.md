@@ -11,12 +11,12 @@
 - **断点续跑** — 中断后重跑自动跳过已完成的视频，进度持久化到 `.progress.json`
 - **字幕级切分** — SRT 输出按标点 + 时长切分为可读短句（2-7 秒 / 条，≤40 字）
 - **多种输出** — SRT 字幕（默认）+ TXT 纯文本 + MD 带时间轴，可选勾选
-- **免费翻译** — 基于 Edge API，零注册零 Key，14 种语言，输出 PotPlayer 兼容双语字幕
+- **免费翻译** — 基于 Bing Translator Web 接口，自动缓存短期会话凭据，14 种语言，输出 PotPlayer 兼容双语字幕
 - **智能跳过** — 导入视频自动检测同名 `.srt` / `.chs.srt`，已翻译的直接跳过，有字幕的只翻译不转写
 - **主字幕交换** — 译文设为 `.srt` 主字幕，原文改为 `.jpn.srt`，PotPlayer 自动加载翻译
 - **SRT 直翻** — 已有 SRT 文件拖入即翻，跳过转写，秒级出结果
 - **每视频清理** — 处理完立即删除临时音频，不堆积 GB 级 temp 文件
-- **全离线** — ASR 模型本地加载，无网络依赖，零数据外泄
+- **本地 ASR** — ASR 模型本地加载；启用翻译时，字幕文本会发送到 Bing Translator Web 接口
 
 ## 硬件要求
 
@@ -82,6 +82,12 @@ uv run python -m src.gui
 >
 > **字幕直翻**：直接把 `.srt` 文件拖进窗口，选择翻译语言，点开始即可跳过转写、只做翻译。
 
+### 翻译凭据缓存
+
+首次翻译时，程序会请求 Bing Translator 页面获取短期会话凭据，并保存到项目根目录的 `.env`。缓存包括 `TRANSLATE_KEY`、`TRANSLATE_TOKEN`、请求标识和 `TRANSLATE_KEY_TIMESTAMP`。
+
+凭据默认缓存 8 分钟；缺少 `.env`、字段不完整或时间戳超过 8 分钟时，程序会自动重新请求。`.env` 已加入 `.gitignore`，不会被 Git 跟踪；可复制 `.env.example` 了解字段格式。不要手动提交真实凭据。
+
 ### 命令行 — 转写 + 翻译
 
 ```bash
@@ -93,8 +99,8 @@ uv run python -m src.main --input ./videos --output ./output --translate zh
 
 # 输出结构：
 #   output/
-#   ├── demo1.srt             ← 原始 SRT 字幕
-#   ├── demo1.chs.srt         ← 中文双语字幕（PotPlayer 可自动加载）
+#   ├── demo1.srt             ← 中文双语字幕（译为主字幕）
+#   ├── demo1.jpn.srt         ← 原始日文字幕
 #   └── ...
 ```
 
@@ -210,7 +216,7 @@ uv run python -m src.main --input ./videos --output ./out --translate zh
 uv run python -m src.gui
 ```
 
-> 翻译基于 Microsoft Edge API，免费、零注册、无需 API Key。支持 14 种目标语言，输出 PotPlayer 兼容的双语字幕（原名.chs.srt / .eng.srt 等）。
+> 翻译基于 Bing Translator Web 接口，免费、无需 API Key。首次使用或缓存过期时会自动刷新 `.env` 中的会话凭据。默认将译文设为 `.srt` 主字幕、原文保存为 `.jpn.srt`；关闭主字幕交换时则生成 `.chs.srt` / `.eng.srt` 等文件。
 
 ## 管线架构
 

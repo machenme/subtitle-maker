@@ -26,12 +26,13 @@ def scan_video_files(
         results.extend(directory.glob(glob_pattern))
 
     # Deduplicate and sort
-    seen: set[str] = set()
+    seen: set[Path] = set()
     unique: list[Path] = []
     for p in sorted(results, key=lambda x: x.name):
-        if p.name not in seen:
-            seen.add(p.name)
-            unique.append(p.resolve())
+        resolved = p.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            unique.append(resolved)
     return unique
 
 

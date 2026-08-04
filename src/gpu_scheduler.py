@@ -176,11 +176,14 @@ class GpuScheduler:
             return {}
 
         self._setup_queues()
-        self._start_workers(task_count=len(tasks))
-        self._enqueue_tasks(tasks)
-        results = self._collect_results(expected=len(tasks), progress_callback=progress_callback)
-        self._shutdown()
-        return results
+        try:
+            self._start_workers(task_count=len(tasks))
+            self._enqueue_tasks(tasks)
+            return self._collect_results(
+                expected=len(tasks), progress_callback=progress_callback
+            )
+        finally:
+            self._shutdown()
 
     # ------------------------------------------------------------------
     # Internal setup

@@ -35,7 +35,8 @@ def translate_srt(
 
     1. Parse *srt_path* into :class:`SrtCue` list.
     2. Split cues into batches of *config.batch_size*.
-    3. Concurrently translate each batch via *provider*.
+    3. Concurrently translate each batch via *provider*, preserving one
+       result per cue.
     4. Merge results back in original order.
     5. Write bilingual SRT.
 
@@ -75,25 +76,30 @@ def translate_srt(
     )
 
     # --- 3. Translate concurrently ---
-    failed_batches: list[int] = []
-
     def _translate_batch(batch_idx: int, indices: list[int]) -> tuple[int, list[str]]:
         """Returns (batch_idx, [translated_lines])."""
-        joined = "\n".join(texts[i] for i in indices)
+        # Flatten internal cue line breaks before sending them. Boundaries
+        # between cues are preserved by translate_batch, not by response
+        # newlines, which translation services may merge or rewrite.
+        request_texts = [" ".join(texts[i].splitlines()) for i in indices]
         try:
-            result = provider.translate(joined, source_lang, target_lang)
-            lines = result.split("\n")
-            # Defend against API merging/splitting differently
+            translate_batch = getattr(provider, "translate_batch", None)
+            if callable(translate_batch):
+                lines = list(translate_batch(request_texts, source_lang, target_lang))
+            else:
+                # Keep compatibility with simple providers that only expose
+                # translate(), while still guaranteeing one request/result per cue.
+                lines = [
+                    provider.translate(text, source_lang, target_lang)
+                    for text in request_texts
+                ]
+
             if len(lines) != len(indices):
-                logger.warning(
-                    "Batch %d: expected %d lines, got %d — using best-effort alignment",
-                    batch_idx, len(indices), len(lines),
+                raise TranslationError(
+                    f"Batch {batch_idx} returned {len(lines)} translations for "
+                    f"{len(indices)} cues; refusing to write misaligned subtitles"
                 )
-                # Pad or trim to match expected count
-                while len(lines) < len(indices):
-                    lines.append("")
-                lines = lines[: len(indices)]
-            return (batch_idx, lines)
+            return (batch_idx, [str(line) for line in lines])
         except TranslationError:
             logger.exception("Batch %d translation failed", batch_idx)
             raise
@@ -141,10 +147,5 @@ def translate_srt(
     )
     write_bilingual_srt(cues, out)
     logger.info("Bilingual SRT written: %s", out)
-
-    if failed_batches and len(failed_batches) == len(batches):
-        raise TranslationError(
-            f"All {len(batches)} batches failed for {file_path.name}"
-        )
 
     return out
