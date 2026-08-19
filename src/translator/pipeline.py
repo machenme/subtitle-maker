@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 from src.translator.types import (
@@ -16,7 +16,8 @@ from src.translator.types import (
     iso_to_player_suffix,
 )
 from src.translator.parser import parse_srt
-from src.translator.writer import write_bilingual_srt
+from src.translator.writer import write_bilingual_srt, write_translation_srt
+from src.utils import atomic_copy_file
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,8 @@ def translate_srt(
     source_lang: str = "auto",
     config: TranslateConfig | None = None,
     output_path: str | Path | None = None,
+    monolingual_output_path: str | Path | None = None,
+    original_output_path: str | Path | None = None,
 ) -> Path:
     """
     Translate an SRT file end-to-end.
@@ -38,7 +41,7 @@ def translate_srt(
     3. Concurrently translate each batch via *provider*, preserving one
        result per cue.
     4. Merge results back in original order.
-    5. Write bilingual SRT.
+    5. Write bilingual SRT and optional translated-only/source copies.
 
     Args:
         srt_path: Path to the source SRT.
@@ -47,7 +50,10 @@ def translate_srt(
         source_lang: ISO 639-1 source language (default ``"auto"``).
         config: Optional tuning overrides.
         output_path: Explicit output path.  Defaults to
-            ``{srt_stem}.{target_lang}.srt`` alongside the source.
+            ``{srt_stem}.{target_lang}.srt`` alongside the source. This is the
+            bilingual output.
+        monolingual_output_path: Optional path for the translated-only SRT.
+        original_output_path: Optional path for a copy of the source SRT.
 
     Returns:
         Path to the written bilingual SRT file.
@@ -78,6 +84,12 @@ def translate_srt(
     # --- 3. Translate concurrently ---
     def _translate_batch(batch_idx: int, indices: list[int]) -> tuple[int, list[str]]:
         """Returns (batch_idx, [translated_lines])."""
+        logger.info(
+            "Translation batch %d/%d queued (%d subtitle(s))",
+            batch_idx + 1,
+            len(batches),
+            len(indices),
+        )
         # Flatten internal cue line breaks before sending them. Boundaries
         # between cues are preserved by translate_batch, not by response
         # newlines, which translation services may merge or rewrite.
@@ -99,32 +111,68 @@ def translate_srt(
                     f"Batch {batch_idx} returned {len(lines)} translations for "
                     f"{len(indices)} cues; refusing to write misaligned subtitles"
                 )
+            logger.info(
+                "Translation batch %d/%d complete",
+                batch_idx + 1,
+                len(batches),
+            )
             return (batch_idx, [str(line) for line in lines])
         except TranslationError:
-            logger.exception("Batch %d translation failed", batch_idx)
+            logger.exception(
+                "Translation batch %d/%d failed",
+                batch_idx + 1,
+                len(batches),
+            )
             raise
 
     start_time = time.time()
     results: dict[int, list[str]] = {}
 
-    with ThreadPoolExecutor(max_workers=cfg.max_workers) as executor:
-        futures: dict[object, int] = {}
-        # Stagger submissions to avoid thundering-herd 429
-        for idx, indices in batches:
-            futures[executor.submit(_translate_batch, idx, indices)] = idx
-            if len(futures) < len(batches):  # not the last one
-                time.sleep(cfg.request_delay)
+    executor = ThreadPoolExecutor(max_workers=cfg.max_workers)
+    futures: dict[object, int] = {}
+    next_batch = 0
+    failed = False
+    active_limit = 1  # Validate the provider boundary protocol before ramping up.
+    try:
+        # Keep only a bounded number of requests in flight. New work is
+        # submitted only after an existing batch completes successfully, so
+        # an invalid response cannot cause the rest of the file to be sent.
+        while next_batch < len(batches) or futures:
+            while next_batch < len(batches) and len(futures) < active_limit:
+                if next_batch:
+                    time.sleep(cfg.request_delay)
+                idx, indices = batches[next_batch]
+                futures[executor.submit(_translate_batch, idx, indices)] = idx
+                next_batch += 1
 
-        for future in as_completed(futures):
-            batch_idx = futures[future]
-            try:
-                idx, lines = future.result()
+            if not futures:
+                break
+
+            done, _ = wait(futures, return_when=FIRST_COMPLETED)
+            completed: list[tuple[int, list[str]]] = []
+            failure: BaseException | None = None
+            for future in sorted(done, key=lambda item: futures[item]):
+                batch_idx = futures.pop(future)
+                try:
+                    completed.append(future.result())
+                except BaseException as exc:
+                    failure = exc
+                    break
+
+            if failure is not None:
+                failed = True
+                for future in futures:
+                    future.cancel()
+                raise failure
+
+            for idx, lines in completed:
                 results[idx] = lines
-            except TranslationError:
-                # Cancel all pending futures and stop immediately
-                for f in futures:
-                    f.cancel()
-                raise
+            if completed:
+                active_limit = cfg.max_workers
+    finally:
+        # Finish already-started requests before reporting failure, so the GUI
+        # cannot finish while worker threads continue logging/API activity.
+        executor.shutdown(wait=True, cancel_futures=failed)
 
     elapsed = time.time() - start_time
     logger.info(
@@ -145,7 +193,53 @@ def translate_srt(
     out = Path(output_path) if output_path else file_path.with_stem(
         f"{file_path.stem}.{suffix}"
     )
+    if original_output_path:
+        atomic_copy_file(file_path, Path(original_output_path))
     write_bilingual_srt(cues, out)
+    if monolingual_output_path:
+        write_translation_srt(cues, monolingual_output_path)
     logger.info("Bilingual SRT written: %s", out)
+    if monolingual_output_path:
+        logger.info("Translated-only SRT written: %s", monolingual_output_path)
 
     return out
+
+
+def translate_srt_with_outputs(
+    srt_path: str | Path,
+    target_lang: str,
+    *,
+    provider: TranslationProvider,
+    source_lang: str = "auto",
+    swap_subtitles: bool = True,
+) -> tuple[Path, Path | None, Path | None]:
+    """Translate an SRT using the project's standard output file layout.
+
+    Returns ``(translated_or_bilingual, bilingual, original)``. The final two
+    paths are ``None`` when subtitle swapping is disabled.
+    """
+    file_path = Path(srt_path)
+    if not swap_subtitles:
+        translated_path = translate_srt(
+            file_path,
+            target_lang,
+            provider=provider,
+            source_lang=source_lang,
+        )
+        return translated_path, None, None
+
+    source_code = source_lang if source_lang != "auto" else "ja"
+    bilingual_path = file_path.with_stem(f"{file_path.stem}.bilingual")
+    original_path = file_path.with_stem(
+        f"{file_path.stem}.{iso_to_player_suffix(source_code)}"
+    )
+    translated_path = translate_srt(
+        file_path,
+        target_lang,
+        provider=provider,
+        source_lang=source_lang,
+        output_path=bilingual_path,
+        monolingual_output_path=file_path,
+        original_output_path=original_path,
+    )
+    return translated_path, bilingual_path, original_path

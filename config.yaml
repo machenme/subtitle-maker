@@ -2,7 +2,7 @@
 # All paths support both absolute and relative (to this config file) paths.
 
 # --- Input / Output ---
-input_dir: "."                    # Input video directory
+input_dir: "."                    # Input media directory
 output_dir: "./output"            # Output text/subtitle directory
 temp_dir: null                    # Temp audio directory (null = system temp)
 
@@ -15,10 +15,10 @@ vad_filter: true                  # Voice activity detection
 compute_type: "float16"           # Inference precision: float16 | int8_float16
 
 # --- Concurrency ---
-max_workers: null                  # Max parallel GPU workers (null = auto: floor((VRAM_GB-3)/2.5))
+max_workers: null                  # Startup probe upper bound (null = 16; falls back on model-load failure)
 chunk_duration: 0                  # 0 = auto (split evenly by worker count), >0 = manual seconds
 
-# --- Video Scanning ---
+# --- Media Scanning ---
 video_extensions:
   - mp4
   - mkv
@@ -26,11 +26,21 @@ video_extensions:
   - avi
   - flv
   - wmv
+  - m4a
+  - mp3
+  - wav
+  - flac
+  - ogg
+  - opus
+  - aac
+  - wma
 
 # --- Output ---
 output_formats:                   # Formats to generate
   - srt
-translate_to: ""                   # Auto-translate SRT to language ("" = skip, e.g. "zh")
+translate_to: "zh"                  # Auto-translate SRT to language ("" = skip)
+translation_provider: "bing"        # bing | gtx
+translation_proxy: ""               # Required by gtx, e.g. http://127.0.0.1:7897
 swap_subtitles: true               # Rename translated → .srt, original → .{lang}.srt
 
 # --- Cleanup ---

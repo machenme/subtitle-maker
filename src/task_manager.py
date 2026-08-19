@@ -176,7 +176,11 @@ class TaskManager:
             source_lang = self._source_lang if self._source_lang != "auto" else "ja"
             source_suffix = iso_to_player_suffix(source_lang)
             if self._swap_subtitles:
-                names.extend([f"{stem}.srt", f"{stem}.{source_suffix}.srt"])
+                names.extend([
+                    f"{stem}.srt",
+                    f"{stem}.bilingual.srt",
+                    f"{stem}.{source_suffix}.srt",
+                ])
             else:
                 names.append(f"{stem}.{target_suffix}.srt")
         return sorted(set(names))

@@ -1,6 +1,6 @@
 """
 Stage 1: Audio extraction via ffmpeg subprocess.
-Extracts audio stream from video files → 16kHz Mono 16-bit PCM WAV.
+Extracts audio streams from media files → 16kHz Mono 16-bit PCM WAV.
 """
 from __future__ import annotations
 
@@ -15,12 +15,12 @@ logger = logging.getLogger(__name__)
 
 
 class AudioExtractionError(Exception):
-    """Raised when ffmpeg fails to extract audio from a video."""
+    """Raised when ffmpeg fails to extract audio from a media file."""
 
 
 class AudioExtractor:
     """
-    Extracts audio from video files using ffmpeg (subprocess).
+    Extracts audio from media files using ffmpeg (subprocess).
 
     Output format: 16 kHz, mono, 16-bit PCM WAV (Whisper native format).
     """
@@ -51,7 +51,13 @@ class AudioExtractor:
         dest_dir = output_dir or self._temp_dir
         dest_dir.mkdir(parents=True, exist_ok=True)
 
-        source_key = str(video_path.resolve()).encode("utf-8")
+        try:
+            stat = video_path.stat()
+        except OSError as exc:
+            raise AudioExtractionError(f"Cannot read source media: {video_path}") from exc
+        source_key = (
+            f"{video_path.resolve()}\0{stat.st_size}\0{stat.st_mtime_ns}"
+        ).encode("utf-8")
         source_hash = hashlib.sha1(source_key).hexdigest()[:10]
         wav_name = f"{video_path.stem}.{source_hash}.wav"
         wav_path = dest_dir / wav_name

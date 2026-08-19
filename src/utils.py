@@ -1,9 +1,12 @@
 """
-Utility functions: video file scanning, file integrity checks, SRT validation.
+Utility functions: media file scanning, file integrity checks, SRT validation.
 """
 from __future__ import annotations
 
+import os
 import re
+import shutil
+import tempfile
 from pathlib import Path
 
 
@@ -13,7 +16,7 @@ def scan_video_files(
     recursive: bool = True,
 ) -> list[Path]:
     """
-    Recursively scan a directory for video files matching the given extensions.
+    Recursively scan a directory for media files matching the given extensions.
 
     Returns a sorted list of absolute paths.
     """
@@ -42,6 +45,45 @@ def is_file_valid(path: Path, min_bytes: int = 100) -> bool:
         return path.exists() and path.is_file() and path.stat().st_size > min_bytes
     except OSError:
         return False
+
+
+def atomic_write_text(path: Path, content: str, *, encoding: str = "utf-8") -> None:
+    """Write text through a same-directory temporary file and atomically replace it."""
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+    )
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding=encoding, newline="\n") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temp_path.replace(destination)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
+def atomic_copy_file(source: Path, destination: Path) -> None:
+    """Copy a file without exposing a partially written destination."""
+    source_path = Path(source)
+    destination_path = Path(destination)
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{destination_path.name}.", suffix=".tmp", dir=destination_path.parent
+    )
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle, source_path.open("rb") as input_file:
+            shutil.copyfileobj(input_file, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temp_path.replace(destination_path)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
 
 
 def is_srt_valid(srt_path: Path) -> bool:

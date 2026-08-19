@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-ASR Pipeline CLI — end-to-end video-to-text for Japanese videos.
+ASR Pipeline CLI — end-to-end speech-to-text for audio and video files.
 
 Usage:
     uv run python -m src.main --input ./videos --output ./subtitles
@@ -22,7 +22,7 @@ import threading
 import time
 
 from src.config import PipelineConfig
-from src.translator import EdgeTranslator, translate_srt
+from src.translator import create_translator, translate_srt_with_outputs
 from src.utils import scan_video_files
 from src.audio_extractor import AudioExtractor
 from src.gpu_scheduler import GpuScheduler
@@ -56,11 +56,11 @@ def run_one_video(
     cancel_event: threading.Event = None,
 ) -> tuple[bool, int, str]:
     """
-    Process a single video through the full pipeline.
+    Process a single media file through the full pipeline.
 
     Args:
         config: Validated PipelineConfig.
-        video_path: Path to the source video file.
+        video_path: Path to the source media file.
         progress_callback: Optional callable(stage, current, total) for progress.
         cancel_event: Optional threading.Event; set to request graceful stop.
 
@@ -156,7 +156,7 @@ def run_one_video(
 
     video_out_dir = output_dir
     video_out_dir.mkdir(parents=True, exist_ok=True)
-    set_cps_language(config.language if config.language != "auto" else "ja")
+    set_cps_language(config.language)
     try:
         written = formatter.write_all(
             segments,
@@ -173,29 +173,30 @@ def run_one_video(
             logger.info(
                 f"Translating SRT: {srt_path.name} → {config.translate_to}"
             )
-            provider = EdgeTranslator()
-            translated_path = translate_srt(
+            provider = create_translator(
+                config.translation_provider,
+                proxy=config.translation_proxy,
+            )
+            source_lang = config.language if config.language != "auto" else "ja"
+            translated_path, bilingual_path, original_path = translate_srt_with_outputs(
                 srt_path,
                 config.translate_to,
                 provider=provider,
-                source_lang=config.language if config.language != "auto" else "auto",
+                source_lang=source_lang,
+                swap_subtitles=config.swap_subtitles,
             )
-            written.append(translated_path)
-
-            # Swap: make translation the primary .srt, move original aside
-            if config.swap_subtitles and translated_path.exists():
-                from src.translator import iso_to_player_suffix
-                src_suffix = iso_to_player_suffix(
-                    config.language if config.language != "auto" else "ja"
+            written.extend(
+                [translated_path, original_path]
+                if config.swap_subtitles and original_path
+                else [translated_path]
+            )
+            if config.swap_subtitles:
+                logger.info(
+                    "Subtitle outputs: %s (translated), %s (bilingual), %s (original)",
+                    srt_path.name,
+                    bilingual_path.name if bilingual_path else "",
+                    original_path.name if original_path else "",
                 )
-                original_renamed = srt_path.with_stem(f"{video_path.stem}.{src_suffix}")
-                if original_renamed.exists():
-                    original_renamed.unlink()
-                srt_path.rename(original_renamed)
-                translated_path.rename(srt_path)
-                logger.info("Swapped subtitles: %s → %s, %s → %s",
-                            srt_path.name, original_renamed.name,
-                            translated_path.name, srt_path.name)
     except Exception:
         if config.cleanup_temp:
             _cleanup_temp_audio(wav_path)
@@ -230,6 +231,16 @@ def _on_sigint(signum, frame):
     _shutdown_requested = True
 
 
+def _exit_code(*, failed_count: int, done_count: int, interrupted: bool) -> int:
+    if interrupted:
+        return 130
+    if failed_count > 0 and done_count == 0:
+        return 3
+    if failed_count > 0:
+        return 2
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -237,10 +248,10 @@ def _on_sigint(signum, frame):
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="asr-pipeline",
-        description="Offline batch Japanese video speech-to-text with GPU parallel inference.",
+        description="Offline batch Japanese audio/video speech-to-text with GPU parallel inference.",
     )
     # Required
-    p.add_argument("--input", required=True, help="Input video directory")
+    p.add_argument("--input", required=True, help="Input audio/video directory")
     p.add_argument("--output", required=True, help="Output text/subtitle directory")
 
     # Optional overrides
@@ -254,9 +265,13 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--compute-type", default=None, help="float16 | int8_float16 | int8")
     p.add_argument("--no-cleanup", action="store_true", help="Keep temp audio files")
     p.add_argument("--chunk-duration", type=int, default=None,
-                   help="Split audio > N seconds into chunks for parallel (default 900, 0=disabled)")
+                   help="Split audio into N-second chunks (0=automatic chunking)")
     p.add_argument("--translate", default=None, metavar="LANG",
                    help="Auto-translate SRT to target language (ISO 639-1, e.g. zh)")
+    p.add_argument("--translator", default=None, choices=("bing", "gtx"),
+                   help="Translation backend (default: bing)")
+    p.add_argument("--proxy", default=None, metavar="URL",
+                   help="Proxy for Legacy GTX, e.g. 127.0.0.1:7897")
     p.add_argument("--verbose", action="store_true", help="Enable DEBUG logging")
     p.add_argument("--force", action="store_true", help="Re-process all files (ignore checkpoint)")
 
@@ -293,6 +308,8 @@ def main():
         "compute_type": cli.compute_type,
         "chunk_duration": cli.chunk_duration,
         "translate_to": cli.translate,
+        "translation_provider": cli.translator,
+        "translation_proxy": cli.proxy,
     }
     if cli.no_vad:
         cli_dict["vad_filter"] = False
@@ -322,10 +339,10 @@ def main():
     logger.info(f"Scanning input directory: {config.input_dir}")
     video_paths = scan_video_files(config.input_dir, config.video_extensions)
     if not video_paths:
-        logger.warning(f"No video files found in {config.input_dir}")
+        logger.warning(f"No audio/video files found in {config.input_dir}")
         sys.exit(0)
 
-    logger.info(f"Found {len(video_paths)} video(s)")
+    logger.info(f"Found {len(video_paths)} media file(s)")
 
     stems = [path.stem for path in video_paths]
     duplicates = sorted({stem for stem in stems if stems.count(stem) > 1})
@@ -392,12 +409,13 @@ def main():
     task_mgr.save_progress()
 
     # --- Exit code ---
-    if failed_count > 0 and task_mgr.done_count == 0:
-        sys.exit(3)
-    elif failed_count > 0:
-        sys.exit(2)
-    else:
-        sys.exit(0)
+    sys.exit(
+        _exit_code(
+            failed_count=failed_count,
+            done_count=task_mgr.done_count,
+            interrupted=_shutdown_requested,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------

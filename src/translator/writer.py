@@ -1,11 +1,10 @@
-"""
-Bilingual SRT writer — produces a single SRT file with original + translation lines.
-"""
+"""SRT writers for translated, bilingual, and source subtitle files."""
 from __future__ import annotations
 
 from pathlib import Path
 
 from src.translator.types import SrtCue
+from src.utils import atomic_write_text
 
 
 def write_bilingual_srt(cues: list[SrtCue], output_path: str | Path) -> None:
@@ -33,4 +32,19 @@ def write_bilingual_srt(cues: list[SrtCue], output_path: str | Path) -> None:
         lines.append(translation)
         lines.append("")  # blank separator
 
-    out_path.write_text("\n".join(lines), encoding="utf-8")
+    atomic_write_text(out_path, "\n".join(lines))
+
+
+def write_translation_srt(cues: list[SrtCue], output_path: str | Path) -> None:
+    """Write one translated subtitle line per cue."""
+    out_path = Path(output_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    lines: list[str] = []
+    for cue in cues:
+        lines.append(str(cue.index))
+        lines.append(f"{cue.start} --> {cue.end}")
+        lines.append(cue.translation or cue.text)
+        lines.append("")
+
+    atomic_write_text(out_path, "\n".join(lines))

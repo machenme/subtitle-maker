@@ -18,6 +18,8 @@ import yaml
 
 DEFAULT_MODEL_PATH = "./models/faster-whisper-large-v3-turbo-ct2"
 VALID_MODEL_SIZES = {"large-v3-turbo", "large-v3", "medium"}
+DEFAULT_MAX_WORKERS = 16
+VALID_TRANSLATION_PROVIDERS = {"bing", "gtx"}
 
 
 def _default_model_path(model_size: str) -> str:
@@ -26,7 +28,7 @@ def _default_model_path(model_size: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# GPU-aware worker count
+# Legacy worker-count helper
 # ---------------------------------------------------------------------------
 
 def detect_optimal_workers(
@@ -35,140 +37,21 @@ def detect_optimal_workers(
     model_path: str | None = None,
 ) -> int:
     """
-    Query GPU **free** VRAM and compute recommended worker count.
+    Return the maximum startup-probe ceiling for backward compatibility.
 
-    If *model_path* is provided, probes actual model memory cost by loading
-    the model once and measuring VRAM delta.  Otherwise uses *model_memory_gb*
-    estimate (~2.8 GB for large-v3-turbo FP16).
-
-    Returns 1 if GPU detection fails.
+    Actual capacity is detected by ``GpuScheduler`` while loading workers.
     """
-    try:
-        import pynvml
-        pynvml.nvmlInit()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_index)
-        mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
-        pynvml.nvmlShutdown()
-
-        free_gb = mem.free / (1024 ** 3)
-
-        # Optional: probe / cache actual model cost
-        cost_gb = model_memory_gb
-        if model_path:
-            from pathlib import Path as _Path
-            p = _Path(model_path)
-            if p.exists():
-                cached = _read_gpu_cache()
-                cache_key = f"{p.resolve()}:float16"
-                if cache_key in cached:
-                    cost_gb = cached[cache_key]
-                else:
-                    probed = _probe_model_vram_cost(str(model_path), gpu_index)
-                    if probed:
-                        cost_gb = probed
-                        cached[cache_key] = round(probed, 2)
-                        _write_gpu_cache(cached)
-
-        # 1.2x buffer to avoid OOM from transient allocations
-        workers = int(free_gb / (cost_gb * 1.2))
-        return max(1, min(8, workers))
-    except Exception:
-        return 1
-
-
-def _probe_worker(q, model_path: str, gpu_index: int, compute_type: str) -> None:
-    """Child-process entry point for model VRAM probing on spawn platforms."""
-    import os as _os
-    import sys as _sys
-
-    dll_dirs: set[str] = set()
-    for path_entry in _sys.path:
-        nvidia_root = _os.path.join(path_entry, "nvidia")
-        if not _os.path.isdir(nvidia_root):
-            continue
-        for package in _os.listdir(nvidia_root):
-            for subdir in ("bin", "lib"):
-                directory = _os.path.join(nvidia_root, package, subdir)
-                if _os.path.isdir(directory):
-                    _os.add_dll_directory(directory)
-                    dll_dirs.add(directory)
-    path_parts = _os.environ.get("PATH", "").split(_os.pathsep)
-    _os.environ["PATH"] = _os.pathsep.join(sorted(dll_dirs) + path_parts)
-
-    import pynvml
-
-    try:
-        pynvml.nvmlInit()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_index)
-        before = pynvml.nvmlDeviceGetMemoryInfo(handle).used
-        pynvml.nvmlShutdown()
-
-        from faster_whisper import WhisperModel
-        WhisperModel(model_path, device="cuda", compute_type=compute_type)
-
-        pynvml.nvmlInit()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_index)
-        after = pynvml.nvmlDeviceGetMemoryInfo(handle).used
-        pynvml.nvmlShutdown()
-        q.put((after - before) / (1024 ** 3))
-    except Exception:
-        try:
-            pynvml.nvmlShutdown()
-        except Exception:
-            pass
-        q.put(None)
-
-
-def _probe_model_vram_cost(model_path: str, gpu_index: int = 0) -> float | None:
-    """Load the model once and return VRAM delta in GB (or None on failure)."""
-    import multiprocessing as _mp
-    import queue as _queue
-
-    try:
-        ctx = _mp.get_context("spawn")
-        result_q: _mp.Queue = ctx.Queue()
-        process = ctx.Process(
-            target=_probe_worker,
-            args=(result_q, model_path, gpu_index, "float16"),
-        )
-        process.start()
-        process.join(timeout=120)
-        if process.is_alive():
-            process.terminate()
-            process.join()
-            return None
-        try:
-            return result_q.get(timeout=5)
-        except _queue.Empty:
-            return None
-    except Exception:
-        return None
-
-
-def _read_gpu_cache() -> dict[str, float]:
-    """Read ``.gpu_cache.json`` from cwd, return ``{model_path: vram_gb}``."""
-    import json as _json
-    try:
-        cache = _json.loads(Path(".gpu_cache.json").read_text(encoding="utf-8"))
-        return cache if isinstance(cache, dict) else {}
-    except Exception:
-        return {}
-
-
-def _write_gpu_cache(cache: dict[str, float]) -> None:
-    """Write ``.gpu_cache.json``."""
-    import json as _json
-    try:
-        Path(".gpu_cache.json").write_text(
-            _json.dumps(cache, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-    except OSError:
-        pass
+    return DEFAULT_MAX_WORKERS
 
 
 VALID_COMPUTE_TYPES = {"float16", "int8_float16", "int8"}
-DEFAULT_VIDEO_EXTENSIONS = ["mp4", "mkv", "mov", "avi", "flv", "wmv"]
+# Common video and audio inputs supported by ffmpeg.
+DEFAULT_MEDIA_EXTENSIONS = [
+    "mp4", "mkv", "mov", "avi", "flv", "wmv",
+    "m4a", "mp3", "wav", "flac", "ogg", "opus", "aac", "wma",
+]
+# Backward-compatible alias for callers using the old constant name.
+DEFAULT_VIDEO_EXTENSIONS = DEFAULT_MEDIA_EXTENSIONS
 
 
 @dataclass
@@ -184,12 +67,14 @@ class PipelineConfig:
     beam_size: int = 5
     vad_filter: bool = True
     compute_type: str = "float16"
-    max_workers: int = 5
+    max_workers: int = DEFAULT_MAX_WORKERS  # startup-probe upper bound
     chunk_duration: int = 0  # seconds; 0 = auto (split evenly by worker count)
     video_extensions: list[str] = field(default_factory=lambda: DEFAULT_VIDEO_EXTENSIONS.copy())
     output_formats: list[str] = field(default_factory=lambda: ["srt"])
-    translate_to: str = ""  # "" = skip translation; non-empty = ISO 639-1 target
-    swap_subtitles: bool = True  # rename translated → .srt, original → .{lang}.srt
+    translate_to: str = "zh"  # "" = skip translation; non-empty = ISO 639-1 target
+    translation_provider: str = "bing"
+    translation_proxy: str = ""
+    swap_subtitles: bool = True  # write translated .srt, bilingual, and original subtitles
     cleanup_temp: bool = True
     verbose: bool = False
 
@@ -222,11 +107,16 @@ class PipelineConfig:
         config_path = cli.get("config", "./config.yaml")
         raw = cls.from_yaml(config_path)
 
+        def _cli_or_yaml(cli_key: str, yaml_key: str | None = None, default: Any = None) -> Any:
+            if cli_key in cli and cli[cli_key] is not None:
+                return cli[cli_key]
+            return raw.get(yaml_key or cli_key, default)
+
         # --- resolve paths relative to config file location ---
         config_dir = Path(config_path).parent.resolve()
 
         def _resolve_path(key: str) -> Path | None:
-            val = cli.get(key) or raw.get(key)
+            val = _cli_or_yaml(key)
             if val is None or val == "":
                 return None
             p = Path(val)
@@ -239,8 +129,8 @@ class PipelineConfig:
         output_dir = _resolve_path("output_dir") or (config_dir / "output")
         temp_dir = _resolve_path("temp_dir")  # may be None
 
-        model_size = cli.get("model") or raw.get("model_size") or "large-v3-turbo"
-        explicit_model_path = cli.get("model_path") or raw.get("model_path")
+        model_size = _cli_or_yaml("model", "model_size", "large-v3-turbo")
+        explicit_model_path = _cli_or_yaml("model_path")
         # A model selected from CLI/GUI should select its conventional model
         # directory unless the caller supplied a custom path explicitly.
         if cli.get("model") and not cli.get("model_path"):
@@ -252,15 +142,28 @@ class PipelineConfig:
         if not model_path.is_absolute():
             model_path = (config_dir / model_path).resolve()
 
-        language = cli.get("language") or raw.get("language") or "auto"
-        beam_size = int(cli.get("beam_size") or raw.get("beam_size") or 5)
+        language = _cli_or_yaml("language", default="auto")
+        beam_size = int(_cli_or_yaml("beam_size", default=5))
         vad_filter = cli.get("vad_filter", raw.get("vad_filter", True))
-        compute_type = cli.get("compute_type") or raw.get("compute_type") or "float16"
-        max_workers = int(cli.get("workers") or raw.get("max_workers") or detect_optimal_workers())
-        chunk_duration = int(cli.get("chunk_duration") or raw.get("chunk_duration") or 0)
-        video_extensions = cli.get("video_extensions") or raw.get("video_extensions") or DEFAULT_VIDEO_EXTENSIONS
-        output_formats = cli.get("output_formats") or raw.get("output_formats") or ["srt"]
-        translate_to = cli.get("translate_to") or raw.get("translate_to") or ""
+        compute_type = _cli_or_yaml("compute_type", default="float16")
+        max_workers = int(_cli_or_yaml("workers", "max_workers", DEFAULT_MAX_WORKERS))
+        chunk_duration = int(_cli_or_yaml("chunk_duration", default=0))
+        video_extensions = _cli_or_yaml("video_extensions", default=DEFAULT_VIDEO_EXTENSIONS)
+        output_formats = _cli_or_yaml("output_formats", default=["srt"])
+        if cli.get("translate_to") is not None:
+            translate_to = cli["translate_to"]
+        else:
+            translate_to = raw.get("translate_to", "zh")
+        translation_provider = (
+            cli.get("translation_provider")
+            or raw.get("translation_provider")
+            or "bing"
+        )
+        translation_proxy = (
+            cli.get("translation_proxy")
+            if cli.get("translation_proxy") is not None
+            else raw.get("translation_proxy", "")
+        )
         swap_subtitles = cli.get("swap_subtitles", raw.get("swap_subtitles", True))
         cleanup_temp = cli.get("cleanup_temp", raw.get("cleanup_temp", True))
         verbose = cli.get("verbose", raw.get("verbose", False))
@@ -280,6 +183,8 @@ class PipelineConfig:
             video_extensions=list(video_extensions),
             output_formats=list(output_formats),
             translate_to=translate_to,
+            translation_provider=translation_provider,
+            translation_proxy=translation_proxy,
             swap_subtitles=swap_subtitles,
             cleanup_temp=cleanup_temp,
             verbose=verbose,
@@ -299,8 +204,10 @@ class PipelineConfig:
             errors.append(f"Input directory does not exist: {self.input_dir}")
         if self.beam_size < 1 or self.beam_size > 10:
             errors.append(f"beam_size must be 1-10, got {self.beam_size}")
-        if self.max_workers < 1 or self.max_workers > 8:
-            errors.append(f"max_workers must be 1-8, got {self.max_workers}")
+        if self.max_workers < 1 or self.max_workers > DEFAULT_MAX_WORKERS:
+            errors.append(
+                f"max_workers must be 1-{DEFAULT_MAX_WORKERS}, got {self.max_workers}"
+            )
         if self.chunk_duration < 0:
             errors.append(f"chunk_duration must be >= 0, got {self.chunk_duration}")  # 0 = auto, >0 = manual seconds
         if self.model_size not in VALID_MODEL_SIZES:
@@ -315,6 +222,11 @@ class PipelineConfig:
             errors.append(f"Invalid output_formats: {unknown}. Valid: {valid_formats}")
         if self.translate_to and "srt" not in self.output_formats:
             errors.append("translate_to requires 'srt' in output_formats")
+        if self.translation_provider not in VALID_TRANSLATION_PROVIDERS:
+            errors.append(
+                "translation_provider must be one of "
+                f"{sorted(VALID_TRANSLATION_PROVIDERS)}, got {self.translation_provider}"
+            )
 
         if errors:
             raise ValueError("Configuration errors:\n  - " + "\n  - ".join(errors))
@@ -325,11 +237,11 @@ class PipelineConfig:
 
     @property
     def effective_temp_dir(self) -> Path:
-        """Return temp_dir or OS default temp directory."""
+        """Return an explicit temp_dir or a process-isolated default directory."""
         if self.temp_dir:
             return self.temp_dir
         import tempfile
-        return Path(tempfile.gettempdir()) / "asr-pipeline-temp"
+        return Path(tempfile.gettempdir()) / "asr-pipeline-temp" / str(os.getpid())
 
     def __repr__(self) -> str:
         lines = ["PipelineConfig:"]

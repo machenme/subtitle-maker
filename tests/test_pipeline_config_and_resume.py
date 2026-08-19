@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from src.config import PipelineConfig
+from src.main import _exit_code
 from src.task_manager import TaskManager
 
 
@@ -85,3 +86,46 @@ def test_changed_input_is_requeued_and_srt_only_output_is_complete(tmp_path: Pat
     pending = changed.build_queue([source])
     assert len(pending) == 1
     assert pending[0].video_path == source
+
+
+def test_translation_defaults_to_chinese_and_requires_three_subtitles(tmp_path: Path):
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, model_path)
+
+    config = PipelineConfig.build({"config": str(config_path)})
+    assert config.translate_to == "zh"
+    assert PipelineConfig.build({"config": str(config_path), "translate_to": ""}).translate_to == ""
+
+    manager = TaskManager(
+        tmp_path / "output",
+        output_formats=["srt"],
+        translate_to="zh",
+        swap_subtitles=True,
+        source_lang="en",
+    )
+    assert manager._expected_output_names("movie") == [
+        "movie.bilingual.srt",
+        "movie.eng.srt",
+        "movie.srt",
+    ]
+
+
+def test_zero_chunk_duration_from_cli_overrides_yaml(tmp_path: Path):
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, model_path)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8") + "\nchunk_duration: 900\n",
+        encoding="utf-8",
+    )
+
+    config = PipelineConfig.build({"config": str(config_path), "chunk_duration": 0})
+
+    assert config.chunk_duration == 0
+
+
+def test_interrupted_run_has_nonzero_exit_code():
+    assert _exit_code(failed_count=0, done_count=1, interrupted=True) == 130
