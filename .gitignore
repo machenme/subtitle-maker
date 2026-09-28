@@ -1,3 +1,7 @@
+# Built desktop launcher
+ASR-Pipeline.exe
+*.spec
+
 # Python
 __pycache__/
 *.py[cod]
@@ -30,8 +34,12 @@ temp_audio/
 *.log
 .progress.json
 
-# Models (downloaded separately)
-models/
+# Models (downloaded separately) — only the placeholder is tracked
+models/*
+!models/README.md
+
+# WorkBuddy project data
+.workbuddy/
 
 # Demo videos
 *.mp4
@@ -40,6 +48,10 @@ models/
 *.avi
 *.flv
 *.wmv
+*.m4a
+*.mp3
+*.aac
+*.ogg
 
 # Secrets
 .env

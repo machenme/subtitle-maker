@@ -24,7 +24,7 @@ def transcribe_worker(
     beam_size: int = 5,
     vad_filter: bool = True,
     compute_type: str = "float16",
-) -> list[Segment]:
+) -> tuple[list[Segment], str]:
     """
     Transcribe a single audio file using faster-whisper.
 
@@ -40,7 +40,7 @@ def transcribe_worker(
         compute_type: "float16", "int8_float16", etc.
 
     Returns:
-        List of Segment objects with start/end timestamps and text.
+        Transcribed segments and Whisper's detected ISO 639-1 language code.
     """
     # Deferred import: only the child process imports faster_whisper
     from faster_whisper import WhisperModel
@@ -76,7 +76,7 @@ def transcribe_worker(
         ))
 
     logger.info(f"[{audio_path.stem}] → {len(segments)} segments")
-    return segments
+    return segments, info.language
 
 
 # ---------------------------------------------------------------------------

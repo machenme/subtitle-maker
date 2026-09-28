@@ -7,3 +7,4 @@ nvidia-cuda-runtime-cu12>=12.0.0
 pyside6>=6.8.0
 python-dotenv>=1.0.1
 requests>=2.32.0
+llama-cpp-python>=0.3.0   # 本地 Hy-MT2 GGUF 模型翻译（llm 后端）

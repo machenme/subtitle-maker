@@ -35,7 +35,7 @@ _RESULT_POLL_TIMEOUT = 1
 # ---------------------------------------------------------------------------
 
 TaskRequest = tuple[Path, Path]          # (audio_path, video_path)
-TaskResult = tuple[Path, list[Segment]]  # (video_path, segments)
+TaskResult = tuple[Path, tuple[list[Segment], str]]  # (audio_path, (segments, language))
 TaskError = tuple[Path, str]             # (video_path, error_message)
 
 
@@ -150,7 +150,7 @@ def _worker_process(
             logger.info(f"Worker-{worker_id} processing: {video_path.name}")
 
             try:
-                segments = transcribe_worker(
+                segments, detected_language = transcribe_worker(
                     model_path=str(model_path),
                     audio_path=audio_path,
                     language=language,
@@ -158,7 +158,7 @@ def _worker_process(
                     vad_filter=vad_filter,
                     compute_type=compute_type,
                 )
-                result_queue.put((audio_path, segments))
+                result_queue.put((audio_path, (segments, detected_language)))
             except Exception as exc:
                 logger.error(f"Worker-{worker_id} error on {audio_path.name}: {exc}")
                 result_queue.put((audio_path, str(exc)))
@@ -204,7 +204,7 @@ class GpuScheduler:
         tasks: list[tuple[Path, Path]],  # [(audio_path, video_path), ...]
         *,
         progress_callback: callable = None,  # (received: int, total: int) -> None
-    ) -> dict[Path, list[Segment]]:
+    ) -> dict[Path, tuple[list[Segment], str]]:
         """
         Run ASR transcription on all queued audio files.
 
@@ -213,7 +213,7 @@ class GpuScheduler:
             progress_callback: Optional callback for progress updates.
 
         Returns:
-            Dict mapping audio_path → list of Segments.
+            Dict mapping audio_path → (segments, detected language).
             Failed tasks are excluded from the dict (errors are logged).
         """
         if not tasks:
@@ -360,9 +360,9 @@ class GpuScheduler:
 
     def _collect_results(
         self, expected: int, *, progress_callback: callable = None
-    ) -> dict[Path, list[Segment]]:
+    ) -> dict[Path, tuple[list[Segment], str]]:
         """Drain result queue until expected count reached."""
-        results: dict[Path, list[Segment]] = {}
+        results: dict[Path, tuple[list[Segment], str]] = {}
         received = 0
         errors = 0
 

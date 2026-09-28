@@ -13,9 +13,22 @@ dependencies = [
     "pyside6>=6.8.0",
     "python-dotenv>=1.0.1",
     "requests>=2.32.0",
+    "llama-cpp-python>=0.3.35",
 ]
 
 [dependency-groups]
 dev = [
     "pyinstaller>=6.21.0",
 ]
+
+# NOTE: llama-cpp-python must be the CUDA build for GPU offloading.
+# PyPI's default wheel is CPU-only, and the official CUDA wheel index
+# (abetlen.github.io) downloads from GitHub which may be unreachable.
+# Install manually after `uv sync`:
+#   1. Download llama_cpp_python-0.3.35-py3-none-win_amd64.whl from
+#      https://github.com/abetlen/llama-cpp-python/releases/tag/v0.3.35-cu124
+#      (via a mirror if needed, e.g. https://ghproxy.net/<full-url>)
+#   2. uv pip install --no-index --no-deps <path-to-wheel> diskcache jinja2 markupsafe
+# The CUDA runtime DLLs (cudart/cublas) are provided by the nvidia-cuda-runtime-cu12
+# and nvidia-cublas-cu12 packages already in dependencies; src/translator/llm.py
+# registers those DLL directories automatically at load time.

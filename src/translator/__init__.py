@@ -9,6 +9,7 @@ Public API
 - :func:`write_bilingual_srt` — write bilingual SRT from cue list.
 - :class:`EdgeTranslator` — Bing Translator web backend (legacy class name).
 - :class:`GtxTranslator` — Legacy Google GTX web backend.
+- :class:`LlmTranslator` — Local Hy-MT2 GGUF backend (llama.cpp).
 - :class:`TranslateConfig` — batch-tuning configuration.
 - :class:`SrtCue` — parsed subtitle entry.
 - :class:`TranslationError` — unrecoverable translation failure.
@@ -25,6 +26,7 @@ from src.translator.parser import parse_srt
 from src.translator.writer import write_bilingual_srt, write_translation_srt
 from src.translator.edge import EdgeTranslator
 from src.translator.gtx import GtxTranslator
+from src.translator.llm import LlmTranslator
 from src.translator.pipeline import translate_srt, translate_srt_with_outputs
 
 
@@ -34,11 +36,14 @@ def create_translator(provider: str = "bing", *, proxy: str = ""):
         return EdgeTranslator()
     if provider == "gtx":
         return GtxTranslator(proxy=proxy)
+    if provider == "llm":
+        return LlmTranslator()
     raise ValueError(f"Unknown translation provider: {provider}")
 
 __all__ = [
     "EdgeTranslator",
     "GtxTranslator",
+    "LlmTranslator",
     "ParseError",
     "SrtCue",
     "TranslateConfig",

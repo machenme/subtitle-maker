@@ -14,6 +14,7 @@ import html
 import logging
 import os
 import copy
+import re
 from queue import Queue
 import sys
 import subprocess
@@ -24,11 +25,20 @@ from pathlib import Path
 if __name__ == "__main__" and str(Path(__file__).resolve().parent.parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from PySide6.QtCore import QPoint, QThread, QTimer, Qt, QObject, Signal
-from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QFont, QPainter, QPolygon
+from PySide6.QtCore import QByteArray, QPoint, QSettings, QThread, QTimer, Qt, QObject, QUrl, Signal
+from PySide6.QtGui import (
+    QColor,
+    QDesktopServices,
+    QDragEnterEvent,
+    QDropEvent,
+    QFont,
+    QPainter,
+    QPolygon,
+)
 from PySide6.QtWidgets import (
-    QApplication,
+    QAbstractItemView,
     QAbstractSpinBox,
+    QApplication,
     QCheckBox,
     QComboBox,
     QFileDialog,
@@ -65,7 +75,11 @@ from src.translator import (
     TranslationError,
     create_translator,
     iso_to_player_suffix,
+    translate_srt,
     translate_srt_with_outputs,
+    parse_srt,
+    write_bilingual_srt,
+    write_translation_srt,
 )
 from src.utils import is_srt_valid
 
@@ -95,8 +109,8 @@ QFrame#dropZone {
     border-radius: 8px;
 }
 QFrame#dropZone:hover { background: #f0f7ff; border-color: #2f76c7; }
-QLabel#title { color: #183153; font-size: 22pt; font-weight: 700; }
-QLabel#subtitle { color: #607590; font-size: 10pt; }
+QLabel#title { color: #183153; font-size: 14pt; font-weight: 600; }
+QLabel#subtitle { color: #607590; font-size: 9pt; }
 QLabel#sectionTitle { color: #263b59; font-size: 11pt; font-weight: 700; }
 QLabel#muted { color: #52677f; }
 QLabel#dropTitle { color: #28476e; font-size: 12pt; font-weight: 600; }
@@ -173,7 +187,7 @@ QHeaderView::section {
     color: #72839a;
     border: 0;
     border-bottom: 1px solid #e5ebf2;
-    padding: 9px 8px;
+    padding: 4px 8px;
     font-weight: 600;
 }
 QProgressBar {
@@ -186,6 +200,7 @@ QProgressBar {
     max-height: 10px;
 }
 QProgressBar::chunk { background: #3b82c4; border-radius: 5px; }
+QProgressBar#thin { min-height: 6px; max-height: 6px; }
 QTextEdit {
     background: #172235;
     border: 0;
@@ -240,8 +255,37 @@ TRANSLATE_MAP = {
 TRANSLATOR_MAP = {
     "Microsoft Edge Translator (免费)": "bing",
     "Legacy GTX (免费)": "gtx",
+    "本地 Hy-MT2 模型 (离线)": "llm",
 }
 MEDIA_SUFFIXES = {*DEFAULT_MEDIA_EXTENSIONS, "srt"}
+# CTranslate2 repos backing the model combo. Verified reachable Sep 2026.
+HF_BASE_URL = "https://huggingface.co"
+HF_MIRROR_BASE_URL = "https://hf-mirror.com"
+MODEL_REPOS = {
+    "large-v3-turbo": "deepdml/faster-whisper-large-v3-turbo-ct2",
+    "large-v3": "Systran/faster-whisper-large-v3",
+    "medium": "Systran/faster-whisper-medium",
+}
+DEFAULT_MODEL_REPO = MODEL_REPOS["large-v3-turbo"]
+# Every entry needs a matching repo above, otherwise there is nothing to offer
+# users when the model is missing (see tests/test_gui_model_guard.py).
+MODEL_SIZES = ("large-v3-turbo", "large-v3", "medium")
+# Without these the model directory exists but every transcription fails.
+MODEL_REQUIRED_FILES = ("config.json", "model.bin")
+# Raised by PipelineConfig.validate() when the model directory is missing.
+MODEL_PATH_ERROR_MARKER = "Model path does not exist"
+# Queue table column indices — keep every row/column access in sync with these.
+COL_FILE = 0
+COL_PROGRESS = 1
+COL_DURATION = 2
+COL_STATUS = 3
+# Height budget for the log strip when collapsed (card + inner log view).
+LOG_CARD_COLLAPSED = 104
+LOG_VIEW_COLLAPSED = 58
+LOG_VIEW_EXPANDED = 280
+# Window geometry persistence.
+SETTINGS_ORG = "ASR Pipeline"
+SETTINGS_APP = "ASR Pipeline"
 
 
 def _card(title: str, subtitle: str = "") -> tuple[QFrame, QVBoxLayout]:
@@ -280,12 +324,11 @@ class DropZone(QFrame):
         title.setObjectName("dropTitle")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title.setFixedHeight(24)
-        hint = QLabel("支持 MP4、M4A、MP3、WAV、FLAC、OGG 等格式")
+        hint = QLabel("支持 MP4、M4A、MP3、WAV、FLAC、OGG、SRT，也可拖入整个文件夹")
         hint.setObjectName("dropHint")
         hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         hint.setFixedHeight(22)
         choose = QPushButton("选择文件")
-        choose.setFixedHeight(28)
         choose.clicked.connect(self.choose_requested.emit)
         layout.addWidget(icon)
         layout.addWidget(title)
@@ -305,6 +348,60 @@ class DropZone(QFrame):
             event.acceptProposedAction()
         else:
             event.ignore()
+
+
+class QueueTable(QTableWidget):
+    """Row table that doubles as a drop target — files can land anywhere on it."""
+
+    files_dropped = Signal(list)
+
+    _ACTIVE_STYLE = "QTableWidget { border: 2px dashed #2f76c7; background: #f0f7ff; }"
+
+    def __init__(self, column_count: int, parent: QWidget | None = None):
+        super().__init__(0, column_count, parent)
+        self.setAcceptDrops(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
+        self.setDragDropOverwriteMode(False)
+        self.setDefaultDropAction(Qt.DropAction.CopyAction)
+        self._drag_active = False
+
+    @staticmethod
+    def _local_paths(mime_data) -> list[str]:
+        return [url.toLocalFile() for url in mime_data.urls() if url.isLocalFile()]
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if event.mimeData().hasUrls():
+            self._set_drag_active(True)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event) -> None:
+        self._set_drag_active(False)
+        event.accept()
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        paths = self._local_paths(event.mimeData())
+        self._set_drag_active(False)
+        if paths:
+            self.files_dropped.emit(paths)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def _set_drag_active(self, active: bool) -> None:
+        if self._drag_active == active:
+            return
+        self._drag_active = active
+        self.setStyleSheet(self._ACTIVE_STYLE if active else "")
+        self.style().unpolish(self)
+        self.style().polish(self)
 
 
 class ArrowSpinBox(QSpinBox):
@@ -382,13 +479,14 @@ class PipelineWorker(QObject):
         if target_lang:
             target_path = Path(f"{base}.{iso_to_player_suffix(target_lang)}.srt")
             if swap_subtitles:
-                source_code = source_lang if source_lang != "auto" else "ja"
-                source_suffix = iso_to_player_suffix(source_code)
                 required = (
                     Path(f"{base}.srt"),
                     Path(f"{base}.bilingual.srt"),
-                    Path(f"{base}.{source_suffix}.srt"),
                 )
+                if source_lang != "auto":
+                    required += (
+                        Path(f"{base}.{iso_to_player_suffix(source_lang)}.srt"),
+                    )
                 if all(is_srt_valid(path) for path in required):
                     return "done"
             elif is_srt_valid(target_path):
@@ -401,7 +499,9 @@ class PipelineWorker(QObject):
             return "translate" if target_lang else "done"
         return "asr"
 
-    def _translate_subtitles(self, media_path: Path, srt_path: Path) -> None:
+    def _translate_subtitles(
+        self, media_path: Path, srt_path: Path, source_lang: str
+    ) -> None:
         """Translate one completed SRT without blocking the ASR producer."""
         translate_srt_with_outputs(
             srt_path,
@@ -410,13 +510,13 @@ class PipelineWorker(QObject):
                 self.config.translation_provider,
                 proxy=self.config.translation_proxy,
             ),
-            source_lang=self.config.language,
+            source_lang=source_lang,
             swap_subtitles=self.config.swap_subtitles,
         )
 
     def _run_translation_queue(
         self,
-        translation_queue: Queue[tuple[Path, Path] | None],
+        translation_queue: Queue[tuple[Path, Path, str] | None],
         results: Queue[tuple[Path, str, str]],
     ) -> None:
         """Consume subtitle jobs serially while ASR continues in the Qt worker."""
@@ -425,7 +525,7 @@ class PipelineWorker(QObject):
             if task is None:
                 return
 
-            media_path, srt_path = task
+            media_path, srt_path, source_lang = task
             if self.cancel_event.is_set():
                 self.file_status.emit(str(media_path), "等待翻译")
                 results.put((media_path, "deferred", ""))
@@ -433,7 +533,7 @@ class PipelineWorker(QObject):
 
             self.file_status.emit(str(media_path), "翻译中")
             try:
-                self._translate_subtitles(media_path, srt_path)
+                self._translate_subtitles(media_path, srt_path, source_lang)
             except TranslationError as exc:
                 self.file_status.emit(str(media_path), "翻译失败")
                 self.log.emit(f"翻译失败: {media_path.name} — {exc}")
@@ -468,11 +568,19 @@ class PipelineWorker(QObject):
         done_count = 0
         failed_count = 0
         total = len(self.paths)
-        translation_queue: Queue[tuple[Path, Path] | None] = Queue()
+        # The local LLM backend translates only after ALL ASR work is done so
+        # the translation model gets exclusive VRAM (no competition with
+        # Whisper workers). Web backends keep the concurrent queue.
+        llm_mode = (
+            self.config.translation_provider == "llm" and bool(self.config.translate_to)
+        )
+        llm_pending: list[tuple[Path, Path, str]] = []  # deferred LLM jobs
+        self._llm_pending = llm_pending
+        translation_queue: Queue[tuple[Path, Path, str] | None] = Queue()
         translation_results: Queue[tuple[Path, str, str]] = Queue()
         translation_thread: threading.Thread | None = None
 
-        if self.config.translate_to:
+        if self.config.translate_to and not llm_mode:
             translation_thread = threading.Thread(
                 target=self._run_translation_queue,
                 args=(translation_queue, translation_results),
@@ -516,18 +624,32 @@ class PipelineWorker(QObject):
                     else:
                         srt_path = media_path.with_suffix(".srt")
                     self.file_status.emit(str(media_path), "等待翻译")
-                    translation_queue.put((media_path, srt_path))
+                    if llm_mode:
+                        llm_pending.append((media_path, srt_path, self.config.language))
+                    else:
+                        translation_queue.put((media_path, srt_path, self.config.language))
                     self.progress.emit(100.0, index, total)
                     continue
 
                 self.file_status.emit(str(media_path), "处理中")
                 asr_config = copy.copy(self.config)
                 asr_config.translate_to = ""
+                detected_language: str | None = None
+
+                def capture_detected_language(stage, value, _total):
+                    nonlocal detected_language
+                    if stage == "detected_language":
+                        detected_language = value
+
                 ok, segment_count, error = run_one_video(
                     asr_config,
                     media_path,
-                    progress_callback=lambda _stage, current, target, i=index, t=total: self.progress.emit(
-                        (current / max(target, 1)) * 100, i, t
+                    progress_callback=lambda stage, current, target, i=index, t=total: (
+                        capture_detected_language(stage, current, target)
+                        if stage == "detected_language"
+                        else self.progress.emit(
+                            (current / max(target, 1)) * 100, i, t
+                        )
                     ),
                     cancel_event=self.cancel_event,
                 )
@@ -535,7 +657,18 @@ class PipelineWorker(QObject):
                     if self.config.translate_to:
                         srt_path = self.config.output_dir / f"{media_path.stem}.srt"
                         self.file_status.emit(str(media_path), "等待翻译")
-                        translation_queue.put((media_path, srt_path))
+                        if llm_mode:
+                            llm_pending.append((
+                                media_path,
+                                srt_path,
+                                detected_language or self.config.language,
+                            ))
+                        else:
+                            translation_queue.put((
+                                media_path,
+                                srt_path,
+                                detected_language or self.config.language,
+                            ))
                     else:
                         self.file_status.emit(str(media_path), f"完成 · {segment_count} 段")
                         done_count += 1
@@ -564,6 +697,52 @@ class PipelineWorker(QObject):
             done_count += completed
             failed_count += failures
 
+        # --- Deferred local-LLM translation pass (after all ASR) ---
+        if llm_mode and not self.cancel_event.is_set() and self._llm_pending:
+            self._log.emit(
+                "转写完成，开始本地模型翻译（独占显存，"
+                f"{len(self._llm_pending)} 个文件）"
+            )
+            provider = None
+            try:
+                from src.translator.llm import (
+                    LlmTranslator,
+                    wait_for_vram_release,
+                )
+
+                wait_for_vram_release(LlmTranslator.minimum_free_vram_bytes())
+                provider = LlmTranslator()
+                provider.translate("预热", source_lang="auto", target_lang="zh")
+            except Exception as exc:
+                self._log.emit(f"本地翻译模型加载失败: {exc}")
+                for media_path, _srt, _lang in self._llm_pending:
+                    self.file_status.emit(str(media_path), "翻译失败")
+                    failed_count += 1
+                self._llm_pending.clear()
+            for media_path, srt_path, source_lang in self._llm_pending:
+                if self.cancel_event.is_set():
+                    break
+                self.file_status.emit(str(media_path), "翻译中")
+                try:
+                    translate_srt_with_outputs(
+                        srt_path,
+                        self.config.translate_to,
+                        provider=provider,
+                        source_lang=source_lang,
+                        swap_subtitles=self.config.swap_subtitles,
+                    )
+                except Exception as exc:
+                    self.file_status.emit(str(media_path), "翻译失败")
+                    self._log.emit(f"翻译失败: {media_path.name} — {exc}")
+                    failed_count += 1
+                else:
+                    self.file_status.emit(str(media_path), "完成 · 已翻译")
+                    done_count += 1
+            self._llm_pending.clear()
+            # Return VRAM to the system once the translation pass ends.
+            if provider is not None:
+                provider.release()
+
         self.finished.emit(
             done_count,
             total,
@@ -577,12 +756,14 @@ class AsrWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("ASR Pipeline")
-        self.setMinimumSize(1000, 820)
-        self.resize(1180, 860)
+        self.setMinimumSize(960, 620)
+        self.setAcceptDrops(True)
+        self._restore_geometry()
 
         self.paths: list[Path] = []
         self.file_status: dict[str, str] = {}
         self._row_by_path: dict[str, int] = {}
+        self._progress_bars: dict[str, QProgressBar] = {}
         self._cancel = threading.Event()
         self._thread: QThread | None = None
         self._worker: PipelineWorker | None = None
@@ -596,6 +777,32 @@ class AsrWindow(QMainWindow):
         self._build_ui()
         self._start_gpu_monitor()
         self._append_log("ASR Pipeline 已启动。拖入音视频或点击“选择文件”开始。")
+
+    def _restore_geometry(self) -> None:
+        saved = QSettings(SETTINGS_ORG, SETTINGS_APP).value("geometry")
+        if isinstance(saved, QByteArray) and not saved.isEmpty():
+            self.restoreGeometry(saved)
+        else:
+            self.resize(1180, 860)
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt API naming
+        QSettings(SETTINGS_ORG, SETTINGS_APP).setValue("geometry", self.saveGeometry())
+        super().closeEvent(event)
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802 - Qt API naming
+        """Window-wide fallback so files can land anywhere outside the table."""
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event: QDropEvent) -> None:  # noqa: N802 - Qt API naming
+        paths = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
+        if paths:
+            self._add_paths_from_strings(paths)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
 
     def _setup_logging(self) -> None:
         root_logger = logging.getLogger()
@@ -631,9 +838,9 @@ class AsrWindow(QMainWindow):
         card = QFrame()
         card.setObjectName("header")
         layout = QHBoxLayout(card)
-        layout.setContentsMargins(20, 15, 20, 15)
+        layout.setContentsMargins(20, 10, 20, 10)
         title_box = QVBoxLayout()
-        title_box.setSpacing(2)
+        title_box.setSpacing(0)
         title = QLabel("ASR Pipeline")
         title.setObjectName("title")
         subtitle = QLabel("音视频转写 · 本地 GPU 加速 · SRT / TXT / Markdown")
@@ -642,51 +849,55 @@ class AsrWindow(QMainWindow):
         title_box.addWidget(subtitle)
         layout.addLayout(title_box)
         layout.addStretch()
-        status_box = QVBoxLayout()
-        status_box.setSpacing(5)
         badge = QLabel("LOCAL  ·  GPU")
         badge.setObjectName("badge")
-        status_box.addWidget(badge, alignment=Qt.AlignmentFlag.AlignRight)
-        self.gpu_label = QLabel("GPU 检测中...")
-        self.gpu_label.setObjectName("gpuValue")
-        self.gpu_label.setAlignment(Qt.AlignmentFlag.AlignRight)
-        status_box.addWidget(self.gpu_label)
-        layout.addLayout(status_box)
+        layout.addWidget(badge, alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         return card
 
     def _build_left_panel(self) -> QWidget:
         panel = QWidget()
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(12)
+        layout.setSpacing(10)
 
-        drop_card, drop_layout = _card("输入文件", "支持批量处理，自动检测同名字幕并支持断点续跑")
-        drop_card.setMaximumHeight(220)
+        # The big drop zone is only shown as an empty state. Once files are in
+        # the queue the table itself takes over as the drop target, which hands
+        # ~200px back to the queue instead.
+        self.drop_card, drop_layout = _card("输入文件", "支持批量处理，自动检测同名字幕并支持断点续跑")
+        self.drop_card.setMaximumHeight(200)
         self.drop_zone = DropZone()
         self.drop_zone.files_dropped.connect(self._add_paths_from_strings)
         self.drop_zone.choose_requested.connect(self._choose_files)
         drop_layout.addWidget(self.drop_zone)
-        layout.addWidget(drop_card)
+        layout.addWidget(self.drop_card)
 
         list_card, list_layout = _card("处理队列")
         self.queue_summary = QLabel("尚未添加文件")
         self.queue_summary.setObjectName("muted")
         list_layout.addWidget(self.queue_summary)
-        self.file_table = QTableWidget(0, 3)
-        self.file_table.setHorizontalHeaderLabels(["文件", "时长", "状态"])
+        self.file_table = QueueTable(4)
+        self.file_table.setHorizontalHeaderLabels(["文件", "进度", "时长", "状态"])
         self.file_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.file_table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
         self.file_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.file_table.setAlternatingRowColors(True)
         self.file_table.verticalHeader().setVisible(False)
-        self.file_table.horizontalHeader().setStretchLastSection(False)
-        self.file_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.file_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.file_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.file_table.verticalHeader().setDefaultSectionSize(24)
+        self.file_table.verticalHeader().setMinimumSectionSize(24)
+        header = self.file_table.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(COL_FILE, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(COL_PROGRESS, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(COL_DURATION, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(COL_STATUS, QHeaderView.ResizeMode.Fixed)
+        self.file_table.setColumnWidth(COL_PROGRESS, 72)
+        self.file_table.setColumnWidth(COL_DURATION, 66)
+        self.file_table.setColumnWidth(COL_STATUS, 96)
+        self.file_table.files_dropped.connect(self._add_paths_from_strings)
         self.file_table.doubleClicked.connect(self._open_selected_file)
         queue_host = QWidget()
         self.queue_stack = QStackedLayout(queue_host)
-        self.queue_empty = QLabel("尚未添加文件")
+        self.queue_empty = QLabel("拖入音视频 / SRT 文件（可拖整个文件夹），或点击“添加文件”")
         self.queue_empty.setObjectName("muted")
         self.queue_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.queue_stack.addWidget(self.queue_empty)
@@ -711,23 +922,33 @@ class AsrWindow(QMainWindow):
         actions.addStretch()
         actions.addWidget(clear_button)
         list_layout.addLayout(actions)
-        layout.addWidget(list_card, 2)
+        layout.addWidget(list_card, 1)
 
-        log_card, log_layout = _card("实时日志")
+        # Compact log drawer: collapsed by default so the queue keeps its space.
+        log_card = QFrame()
+        log_card.setObjectName("card")
         self.log_card = log_card
-        log_card.setMaximumHeight(190)
-        log_actions = QHBoxLayout()
-        self.expand_log_check = QCheckBox("展开日志")
+        log_layout = QVBoxLayout(log_card)
+        log_layout.setContentsMargins(14, 8, 14, 8)
+        log_layout.setSpacing(6)
+        log_header = QHBoxLayout()
+        log_title = QLabel("实时日志")
+        log_title.setObjectName("sectionTitle")
+        self.log_hint = QLabel("")
+        self.log_hint.setObjectName("muted")
+        log_header.addWidget(log_title)
+        log_header.addWidget(self.log_hint, 1)
+        self.expand_log_check = QCheckBox("展开")
         self.expand_log_check.toggled.connect(self._set_log_expanded)
-        log_actions.addStretch()
-        log_actions.addWidget(self.expand_log_check)
-        log_layout.addLayout(log_actions)
+        log_header.addWidget(self.expand_log_check)
+        log_layout.addLayout(log_header)
         self.log_edit = QTextEdit()
         self.log_edit.setReadOnly(True)
-        self.log_edit.setMinimumHeight(112)
-        self.log_edit.setMaximumHeight(130)
+        self.log_edit.setAcceptDrops(False)
         self.log_edit.setFont(QFont("Consolas", 9))
         log_layout.addWidget(self.log_edit)
+        log_card.setMaximumHeight(LOG_CARD_COLLAPSED)
+        self._set_log_expanded(False)
         layout.addWidget(log_card)
         return panel
 
@@ -744,6 +965,7 @@ class AsrWindow(QMainWindow):
         output_card, output_layout = _card("输出")
         output_row = QHBoxLayout()
         self.output_edit = QLineEdit(self.default_output_dir)
+        self.output_edit.setAcceptDrops(False)
         self.output_edit.editingFinished.connect(self._on_output_directory_changed)
         browse = QPushButton("浏览")
         browse.clicked.connect(self._browse_output)
@@ -775,7 +997,7 @@ class AsrWindow(QMainWindow):
         grid.setColumnMinimumWidth(0, 64)
         grid.setColumnStretch(1, 1)
         self.model_combo = QComboBox()
-        self.model_combo.addItems(["large-v3-turbo", "large-v3", "medium"])
+        self.model_combo.addItems(list(MODEL_SIZES))
         self.model_combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.model_combo.setCurrentText(self.config.model_size if self.config else "large-v3-turbo")
         self.workers_spin = ArrowSpinBox()
@@ -862,9 +1084,60 @@ class AsrWindow(QMainWindow):
         self._set_translation_enabled(self.translate_check.isChecked())
         layout.addWidget(translate_card)
 
-        layout.addStretch()
+        # The GPU card takes a stretch factor so it grows into whatever space
+        # the three settings cards leave behind — no empty gap at the bottom.
+        layout.addWidget(self._build_gpu_card(), 1)
         scroll.setWidget(content)
         return scroll
+
+    @staticmethod
+    def _add_gpu_metric(grid: QGridLayout, row: int, name: str) -> tuple[QLabel, QProgressBar]:
+        name_label = QLabel(name)
+        name_label.setObjectName("muted")
+        value_label = QLabel("—")
+        value_label.setObjectName("gpuValue")
+        value_label.setMinimumWidth(88)
+        value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        bar = QProgressBar()
+        bar.setObjectName("thin")
+        bar.setRange(0, 100)
+        bar.setValue(0)
+        bar.setTextVisible(False)
+        bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        grid.addWidget(name_label, row, 0)
+        grid.addWidget(value_label, row, 1)
+        grid.addWidget(bar, row, 2)
+        return value_label, bar
+
+    def _build_gpu_card(self) -> QFrame:
+        card = QFrame()
+        card.setObjectName("card")
+        card.setMinimumHeight(150)
+        card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+
+        heading = QLabel("GPU 状态")
+        heading.setObjectName("sectionTitle")
+        layout.addWidget(heading)
+
+        self.gpu_state_label = QLabel("GPU 检测中...")
+        self.gpu_state_label.setObjectName("muted")
+        layout.addWidget(self.gpu_state_label)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(8)
+        grid.setColumnMinimumWidth(0, 48)
+        grid.setColumnStretch(2, 1)
+        self.gpu_util_value, self.gpu_util_bar = self._add_gpu_metric(grid, 0, "利用率")
+        self.gpu_memory_value, self.gpu_memory_bar = self._add_gpu_metric(grid, 1, "显存")
+        self.gpu_temp_value, self.gpu_temp_bar = self._add_gpu_metric(grid, 2, "温度")
+        self.gpu_temp_bar.setMaximum(110)
+        layout.addLayout(grid)
+        layout.addStretch(1)
+        return card
 
     @staticmethod
     def _add_form_row(grid: QGridLayout, row: int, label: str, widget: QWidget) -> QLabel:
@@ -961,6 +1234,8 @@ class AsrWindow(QMainWindow):
         self.queue_stack.setCurrentIndex(1 if self.paths else 0)
         self.queue_summary.setVisible(bool(self.paths))
         self.queue_summary.setText(self._queue_summary_text(list(self.file_status.values())))
+        if hasattr(self, "drop_card"):
+            self.drop_card.setVisible(not self.paths)
         self._refresh_file_action_states()
         self._refresh_run_summary()
 
@@ -973,11 +1248,16 @@ class AsrWindow(QMainWindow):
             can_edit and bool(self.file_table.selectionModel().selectedRows())
         )
         self.clear_button.setEnabled(can_edit and bool(self.paths))
+        if hasattr(self, "start_button"):
+            self.start_button.setEnabled(can_edit and bool(self.paths))
 
     def _set_log_expanded(self, expanded: bool) -> None:
-        self.log_card.setMaximumHeight(16777215 if expanded else 190)
-        self.log_edit.setMaximumHeight(16777215 if expanded else 130)
-        self.log_edit.setMinimumHeight(280 if expanded else 112)
+        height = LOG_VIEW_EXPANDED if expanded else LOG_VIEW_COLLAPSED
+        self.log_card.setMaximumHeight(16777215 if expanded else LOG_CARD_COLLAPSED)
+        self.log_edit.setMinimumHeight(height)
+        self.log_edit.setMaximumHeight(height)
+        self.log_edit.setVisible(True)
+        self.expand_log_check.setText("收起" if expanded else "展开")
 
     def _on_output_directory_changed(self) -> None:
         self._refresh_file_statuses(self.translate_check.isChecked())
@@ -1010,16 +1290,46 @@ class AsrWindow(QMainWindow):
         self._gpu_timer.start(1000)
 
     def _update_gpu(self) -> None:
-        if self._gpu_monitor and self._gpu_monitor.available:
-            snap = self._gpu_monitor.latest()
-            if snap:
-                self.gpu_label.setText(
-                    f"利用率 {snap.utilization_pct}%  ·  显存 "
-                    f"{snap.memory_used_mb / 1024:.1f}/{snap.memory_total_mb / 1024:.1f} GB  ·  "
-                    f"温度 {snap.temperature_c}°C"
-                )
-                return
-        self.gpu_label.setText("未检测到 NVIDIA GPU")
+        monitor = self._gpu_monitor
+        if not (monitor and monitor.available):
+            self.gpu_state_label.setText("未检测到 NVIDIA GPU")
+            self._set_gpu_values(utilization=None, used_gb=None, total_gb=None, temperature=None)
+            return
+
+        snapshot = monitor.latest()
+        if not snapshot:
+            self.gpu_state_label.setText("GPU 初始化中...")
+            self._set_gpu_values(utilization=None, used_gb=None, total_gb=None, temperature=None)
+            return
+
+        used_gb = snapshot.memory_used_mb / 1024
+        total_gb = snapshot.memory_total_mb / 1024
+        self.gpu_state_label.setText("")
+        self._set_gpu_values(
+            utilization=snapshot.utilization_pct,
+            used_gb=used_gb,
+            total_gb=total_gb,
+            temperature=snapshot.temperature_c,
+        )
+
+    def _set_gpu_values(
+        self,
+        *,
+        utilization: int | None,
+        used_gb: float | None,
+        total_gb: float | None,
+        temperature: int | None,
+    ) -> None:
+        self.gpu_util_value.setText(f"{utilization}%" if utilization is not None else "—")
+        self.gpu_util_bar.setValue(int(utilization or 0))
+        if used_gb is not None and total_gb:
+            self.gpu_memory_value.setText(f"{used_gb:.1f} / {total_gb:.1f} GB")
+            self.gpu_memory_bar.setValue(int(used_gb / max(total_gb, 0.001) * 100))
+        else:
+            self.gpu_memory_value.setText("—")
+            self.gpu_memory_bar.setValue(0)
+        self.gpu_temp_value.setText(f"{temperature}°C" if temperature is not None else "—")
+        self.gpu_temp_bar.setValue(int(temperature or 0))
 
     def _update_gtx_controls(self) -> None:
         is_gtx = (
@@ -1071,7 +1381,9 @@ class AsrWindow(QMainWindow):
             self.file_status[str(path)] = status
             row = self._row_by_path.get(str(path))
             if row is not None:
-                self.file_table.item(row, 2).setText(status_labels[status])
+                item = self.file_table.item(row, COL_STATUS)
+                item.setText(status_labels[status])
+                self._style_status_item(item)
         self._refresh_queue_view()
 
     def _on_translator_changed(self, label: str) -> None:
@@ -1109,11 +1421,85 @@ class AsrWindow(QMainWindow):
             self.output_edit.setText(directory)
             self._on_output_directory_changed()
 
-    def _add_paths_from_strings(self, raw_paths: list[str]) -> None:
+    def _model_download_urls(self) -> tuple[str, str, str]:
+        """(repo, Hugging Face url, hf-mirror url) for the selected model."""
+        repo = MODEL_REPOS.get(self.model_combo.currentText(), DEFAULT_MODEL_REPO)
+        return repo, f"{HF_BASE_URL}/{repo}", f"{HF_MIRROR_BASE_URL}/{repo}"
+
+    @staticmethod
+    def _model_missing_files(model_path: Path) -> list[str]:
+        return [name for name in MODEL_REQUIRED_FILES if not (model_path / name).is_file()]
+
+    def _report_missing_model(self, model_path: Path) -> None:
+        """Model is unusable — explain where to get it instead of crashing later."""
+        repo, hf_url, mirror_url = self._model_download_urls()
+        missing = self._model_missing_files(model_path)
+        if not model_path.exists():
+            reason = "目录不存在"
+        else:
+            reason = "不完整，缺少 " + "、".join(missing)
+        self._append_log(f"缺少转写模型: {model_path}（{reason}）")
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("缺少转写模型")
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setText(
+            f"没有找到可用的转写模型（{html.escape(reason)}）。<br><br>"
+            f"当前模型：<b>{html.escape(self.model_combo.currentText())}</b><br>"
+            f"期望目录：<code>{html.escape(str(model_path))}</code>"
+        )
+        box.setInformativeText(
+            "下载后请把整个仓库放进上面的目录（目录名必须带 <b>-ct2</b> 后缀），"
+            "并确保里面有 <code>config.json</code> 和 <code>model.bin</code>。<br><br>"
+            f"Hugging Face 打不开时，用国内镜像 <code>hf-mirror.com</code>，路径完全相同："
+            f"<br><a href=\"{html.escape(hf_url)}\">{html.escape(hf_url)}</a>"
+            f"<br><a href=\"{html.escape(mirror_url)}\">{html.escape(mirror_url)}</a>"
+        )
+        for label in box.findChildren(QLabel):
+            label.setOpenExternalLinks(True)
+        download_button = box.addButton("打开下载页", QMessageBox.ButtonRole.AcceptRole)
+        mirror_button = box.addButton("打开镜像下载页", QMessageBox.ButtonRole.ActionRole)
+        box.addButton("关闭", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is download_button:
+            QDesktopServices.openUrl(QUrl(hf_url))
+        elif clicked is mirror_button:
+            QDesktopServices.openUrl(QUrl(mirror_url))
+
+    @staticmethod
+    def _is_supported_file(path: Path) -> bool:
+        return path.is_file() and path.suffix.lower().lstrip(".") in MEDIA_SUFFIXES
+
+    @staticmethod
+    def _collect_directory(directory: Path) -> list[Path]:
+        found = [child for child in directory.rglob("*") if child.is_file()]
+        return sorted(child for child in found if child.suffix.lower().lstrip(".") in MEDIA_SUFFIXES)
+
+    def _expand_dropped_paths(self, raw_paths: list[str]) -> list[Path]:
+        resolved: list[Path] = []
         for raw_path in raw_paths:
             path = Path(raw_path).expanduser().resolve()
-            if not path.is_file() or path.suffix.lower().lstrip(".") not in MEDIA_SUFFIXES:
-                continue
+            if path.is_dir():
+                found = self._collect_directory(path)
+                if found:
+                    resolved.extend(found)
+                    self._append_log(f"已展开目录: {path.name} → {len(found)} 个文件")
+                else:
+                    self._append_log(f"目录内没有可用的音视频 / SRT 文件: {path}")
+            elif self._is_supported_file(path):
+                resolved.append(path)
+            else:
+                self._append_log(f"跳过不支持的路径: {path.name or path}")
+        return resolved
+
+    def _add_paths_from_strings(self, raw_paths: list[str]) -> None:
+        if self._is_running:
+            self._append_log("警告: 任务运行中，先停止后再添加文件。")
+            return
+        for path in self._expand_dropped_paths(raw_paths):
             self._add_file(path)
 
     def _add_file(self, path: Path) -> None:
@@ -1148,13 +1534,41 @@ class AsrWindow(QMainWindow):
         name_item = QTableWidgetItem(path.name)
         name_item.setToolTip(str(path))
         name_item.setData(Qt.ItemDataRole.UserRole, str(path))
-        self.file_table.setItem(row, 0, name_item)
-        duration = "—" if path.suffix.lower() == ".srt" else self._get_duration(path)
-        self.file_table.setItem(row, 1, QTableWidgetItem(duration))
-        self.file_table.setItem(row, 2, QTableWidgetItem(status_text))
+        self.file_table.setItem(row, COL_FILE, name_item)
+        progress_bar = QProgressBar()
+        progress_bar.setObjectName("thin")
+        progress_bar.setRange(0, 100)
+        progress_bar.setValue(0)
+        progress_bar.setTextVisible(False)
+        self.file_table.setCellWidget(row, COL_PROGRESS, progress_bar)
+        self._progress_bars[str(path)] = progress_bar
+        duration_item = QTableWidgetItem("—" if path.suffix.lower() == ".srt" else self._get_duration(path))
+        duration_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.file_table.setItem(row, COL_DURATION, duration_item)
+        status_item = QTableWidgetItem(status_text)
+        status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._style_status_item(status_item)
+        self.file_table.setItem(row, COL_STATUS, status_item)
         self._row_by_path[str(path)] = row
         self._append_log(f"已添加: {path.name} → {status_text}")
         self._refresh_queue_view()
+
+    @staticmethod
+    def _style_status_item(item: QTableWidgetItem) -> None:
+        """Colour-code the status cell so scanning the queue needs no reading."""
+        text = item.text()
+        if text.startswith("完成") or text == "已有字幕":
+            background, foreground = "#e6f7ee", "#1c7a4b"
+        elif text in {"处理中", "翻译中"}:
+            background, foreground = "#e6f1ff", "#1d5fa8"
+        elif "失败" in text:
+            background, foreground = "#fdeaea", "#b23c3c"
+        elif text == "已停止":
+            background, foreground = "#fdf1e0", "#9a6410"
+        else:
+            background, foreground = "#f1f4f8", "#4f6280"
+        item.setBackground(QColor(background))
+        item.setForeground(QColor(foreground))
 
     @staticmethod
     def _get_duration(path: Path) -> str:
@@ -1175,10 +1589,13 @@ class AsrWindow(QMainWindow):
     def _remove_selected(self) -> None:
         rows = sorted({index.row() for index in self.file_table.selectionModel().selectedRows()}, reverse=True)
         for row in rows:
-            path = Path(self.file_table.item(row, 0).data(Qt.ItemDataRole.UserRole))
+            path = Path(self.file_table.item(row, COL_FILE).data(Qt.ItemDataRole.UserRole))
+            if path not in self.paths:
+                continue
+            self.file_table.removeRow(row)
             self.paths.remove(path)
             self.file_status.pop(str(path), None)
-            self.file_table.removeRow(row)
+            self._progress_bars.pop(str(path), None)
         self._rebuild_row_index()
         self._refresh_queue_view()
 
@@ -1186,22 +1603,40 @@ class AsrWindow(QMainWindow):
         self.paths.clear()
         self.file_status.clear()
         self._row_by_path.clear()
+        self._progress_bars.clear()
         self.file_table.setRowCount(0)
         self._refresh_queue_view()
 
     def _rebuild_row_index(self) -> None:
         self._row_by_path.clear()
+        self._progress_bars.clear()
         for row in range(self.file_table.rowCount()):
-            path = self.file_table.item(row, 0).data(Qt.ItemDataRole.UserRole)
+            path = self.file_table.item(row, COL_FILE).data(Qt.ItemDataRole.UserRole)
             self._row_by_path[path] = row
+            widget = self.file_table.cellWidget(row, COL_PROGRESS)
+            if isinstance(widget, QProgressBar):
+                self._progress_bars[path] = widget
 
     def _open_selected_file(self) -> None:
         row = self.file_table.currentRow()
         if row < 0:
             return
-        path = Path(self.file_table.item(row, 0).data(Qt.ItemDataRole.UserRole))
-        if path.exists() and hasattr(os, "startfile"):
+        path = Path(self.file_table.item(row, COL_FILE).data(Qt.ItemDataRole.UserRole))
+        target = self._output_path_for(path)
+        if target.exists() and hasattr(os, "startfile"):
+            os.startfile(str(target))
+        elif path.exists() and hasattr(os, "startfile"):
             os.startfile(str(path))
+
+    def _output_path_for(self, path: Path) -> Path:
+        """Prefer the generated subtitle over the source media on double-click."""
+        try:
+            output_dir = Path(self.output_edit.text().strip() or path.parent)
+        except Exception:
+            output_dir = path.parent
+        if path.suffix.lower() == ".srt":
+            return path
+        return output_dir / f"{path.stem}.srt"
 
     def _start(self) -> None:
         if not self.paths:
@@ -1221,11 +1656,16 @@ class AsrWindow(QMainWindow):
         translation_provider = TRANSLATOR_MAP[self.translator_combo.currentText()]
         translation_proxy = self.proxy_edit.text().strip()
         source_language = LANGUAGE_MAP[self.language_combo.currentText()]
-        if translate_to and translation_provider == "bing" and source_language == "auto":
+        if (
+            translate_to
+            and translation_provider == "bing"
+            and source_language == "auto"
+            and any(path.suffix.lower() == ".srt" for path in self.paths)
+        ):
             QMessageBox.warning(
                 self,
-                "需要选择源语言",
-                "Microsoft Edge 翻译接口不支持自动检测，请在“识别语言”中选择实际源语言。",
+                "直接翻译 SRT 需要源语言",
+                "视频转写时可由 Whisper 自动识别；直接翻译 SRT 时，请在“识别语言”中选择实际源语言。",
             )
             return
         if translate_to and translation_provider == "gtx" and not translation_proxy:
@@ -1257,7 +1697,19 @@ class AsrWindow(QMainWindow):
                 "swap_subtitles": self.swap_check.isChecked(),
             })
         except Exception as exc:
-            QMessageBox.critical(self, "配置错误", str(exc))
+            message = str(exc)
+            match = re.search(
+                rf"{MODEL_PATH_ERROR_MARKER}:\s*(.+)", message
+            )
+            if match:
+                self._report_missing_model(Path(match.group(1).strip()))
+                return
+            QMessageBox.critical(self, "配置错误", message)
+            return
+        # The directory may exist while still being incomplete — catch it here
+        # rather than failing deep inside the worker.
+        if self._model_missing_files(config.model_path):
+            self._report_missing_model(config.model_path)
             return
 
         self._cancel.clear()
@@ -1288,7 +1740,6 @@ class AsrWindow(QMainWindow):
 
     def _set_running(self, running: bool) -> None:
         self._is_running = running
-        self.start_button.setEnabled(not running)
         self.stop_button.setEnabled(running)
         self.stop_button.setVisible(running)
         for widget in self._settings_widgets:
@@ -1299,15 +1750,22 @@ class AsrWindow(QMainWindow):
             self._update_gtx_controls()
 
     def _update_progress(self, percent: float, file_index: int, total: int) -> None:
-        self.progress.setValue(max(0, min(100, int(percent))))
+        value = max(0, min(100, int(percent)))
+        self.progress.setValue(value)
         self.progress_label.setText(f"处理中 · {percent:.1f}%")
         self.file_counter.setText(f"{file_index + 1}/{total}")
+        if 0 <= file_index < len(self.paths):
+            bar = self._progress_bars.get(str(self.paths[file_index]))
+            if bar is not None and bar.value() != value:
+                bar.setValue(value)
 
     def _update_file_status(self, raw_path: str, status: str) -> None:
         self.file_status[raw_path] = status
         row = self._row_by_path.get(raw_path)
         if row is not None and row < self.file_table.rowCount():
-            self.file_table.item(row, 2).setText(status)
+            item = self.file_table.item(row, COL_STATUS)
+            item.setText(status)
+            self._style_status_item(item)
         self._refresh_queue_view()
 
     def _worker_finished(self, done: int, total: int, failed: int, elapsed: float, cancelled: bool) -> None:
@@ -1334,16 +1792,35 @@ class AsrWindow(QMainWindow):
     def _append_log(self, message: str) -> None:
         if not hasattr(self, "log_edit"):
             return
-        lowered = message.lower()
-        color = "#d9e4f1"
-        if "失败" in message or "error" in lowered or "failed" in lowered:
-            color = "#ff9b9b"
-        elif "完成" in message or "success" in lowered or "已翻译" in message:
-            color = "#9be1b0"
-        elif "警告" in message or "warn" in lowered:
-            color = "#ffd18a"
+        color = self._log_color(message)
         self.log_edit.append(f'<span style="color:{color}">{html.escape(message)}</span>')
         self.log_edit.ensureCursorVisible()
+
+    @staticmethod
+    def _log_color(message: str) -> str:
+        lowered = message.lower()
+        failed_count_match = re.search(
+            r"\bfailed\s*[:=]\s*(\d+)\b|\b(\d+)\s+failed\b",
+            lowered,
+        )
+        has_failure = (
+            "失败" in message
+            or "error" in lowered
+            or (
+                "failed" in lowered
+                and (
+                    failed_count_match is None
+                    or int(next(group for group in failed_count_match.groups() if group)) > 0
+                )
+            )
+        )
+        if has_failure:
+            return "#ff9b9b"
+        if "完成" in message or "success" in lowered or "已翻译" in message:
+            return "#9be1b0"
+        if "警告" in message or "warn" in lowered:
+            return "#ffd18a"
+        return "#d9e4f1"
 
     def closeEvent(self, event) -> None:
         if self._thread and self._thread.isRunning():

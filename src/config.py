@@ -19,7 +19,7 @@ import yaml
 DEFAULT_MODEL_PATH = "./models/faster-whisper-large-v3-turbo-ct2"
 VALID_MODEL_SIZES = {"large-v3-turbo", "large-v3", "medium"}
 DEFAULT_MAX_WORKERS = 16
-VALID_TRANSLATION_PROVIDERS = {"bing", "gtx"}
+VALID_TRANSLATION_PROVIDERS = {"bing", "gtx", "llm"}
 
 
 def _default_model_path(model_size: str) -> str:

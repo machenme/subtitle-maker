@@ -94,7 +94,8 @@ def run_one_video(
         try:
             chunks = extractor.split_wav(wav_path, chunk_sec)
         except Exception as exc:
-            _cleanup_temp_audio(wav_path)
+            if config.cleanup_temp:
+                _cleanup_temp_audio(wav_path)
             return (False, 0, str(exc))
     else:
         chunks = [(0.0, wav_path)]
@@ -102,7 +103,8 @@ def run_one_video(
     logger.info(f"Audio ready: {len(chunks)} chunk(s)")
 
     if _check_cancelled():
-        _cleanup_temp_audio(wav_path)
+        if config.cleanup_temp:
+            _cleanup_temp_audio(wav_path)
         return (False, 0, "Cancelled after extraction")
 
     # --- Stage 2: GPU ASR ---
@@ -128,7 +130,8 @@ def run_one_video(
     elapsed = time.time() - start_time
 
     if _check_cancelled():
-        _cleanup_temp_audio(wav_path)
+        if config.cleanup_temp:
+            _cleanup_temp_audio(wav_path)
         return (False, 0, "Cancelled after transcription")
 
     # --- Stage 3: Merge & write ---
@@ -137,15 +140,19 @@ def run_one_video(
 
     # Collect chunk results
     chunk_results: list[tuple[float, list[Segment]]] = []
+    detected_languages: list[str] = []
     all_done = True
     for offset, chunk_path in chunks:
         if chunk_path in raw_results:
-            chunk_results.append((offset, raw_results[chunk_path]))
+            chunk_segments, detected_language = raw_results[chunk_path]
+            chunk_results.append((offset, chunk_segments))
+            detected_languages.append(detected_language)
         else:
             all_done = False
 
     if not all_done or not chunk_results:
-        _cleanup_temp_audio(wav_path)
+        if config.cleanup_temp:
+            _cleanup_temp_audio(wav_path)
         return (False, 0, "Some chunks failed transcription")
 
     if len(chunk_results) > 1:
@@ -154,9 +161,19 @@ def run_one_video(
     else:
         segments = chunk_results[0][1]
 
+    detected_language = config.language
+    if config.language == "auto" and detected_languages:
+        detected_language = max(
+            dict.fromkeys(detected_languages), key=detected_languages.count
+        )
+    if detected_language == "auto":
+        raise RuntimeError("Whisper did not return a detected source language")
+    if progress_callback:
+        progress_callback("detected_language", detected_language, detected_language)
+
     video_out_dir = output_dir
     video_out_dir.mkdir(parents=True, exist_ok=True)
-    set_cps_language(config.language)
+    set_cps_language(detected_language)
     try:
         written = formatter.write_all(
             segments,
@@ -165,8 +182,10 @@ def run_one_video(
         )
 
         # --- Stage 3b: Translation (optional) ---
+        # The local LLM backend runs as a separate pass after all ASR work
+        # (see run_batch), so it never competes with Whisper for VRAM.
         translated_path: Path | None = None
-        if config.translate_to:
+        if config.translate_to and config.translation_provider != "llm":
             srt_path = video_out_dir / f"{video_path.stem}.srt"
             if not srt_path.exists():
                 raise ValueError("Translation requires SRT output")
@@ -177,12 +196,11 @@ def run_one_video(
                 config.translation_provider,
                 proxy=config.translation_proxy,
             )
-            source_lang = config.language if config.language != "auto" else "ja"
             translated_path, bilingual_path, original_path = translate_srt_with_outputs(
                 srt_path,
                 config.translate_to,
                 provider=provider,
-                source_lang=source_lang,
+                source_lang=detected_language,
                 swap_subtitles=config.swap_subtitles,
             )
             written.extend(
@@ -231,6 +249,66 @@ def _on_sigint(signum, frame):
     _shutdown_requested = True
 
 
+def _run_llm_translation_pass(config: PipelineConfig) -> int:
+    """Translate all pending SRTs with the local LLM, exclusively on the GPU.
+
+    Called after the ASR loop so Whisper workers have already released their
+    VRAM; the translator probes free VRAM at load time and sizes its context
+    and batch-token budget accordingly (1GB safety margin included).
+    Returns the number of failures.
+    """
+    from src.translator.llm import LlmTranslator
+
+    srt_paths = sorted(config.output_dir.glob("*.srt"))
+    # Only fresh outputs from this run need translation; a marker file keeps
+    # the pass idempotent across reruns.
+    pending = [
+        p for p in srt_paths
+        if not p.stem.endswith(tuple(f".{s}" for s in ("bilingual",)))
+        and ".bilingual" not in p.stem
+    ]
+    if not pending:
+        logger.info("LLM translation pass: nothing to translate")
+        return 0
+
+    logger.info(
+        "LLM translation pass: %d subtitle file(s); ASR finished, "
+        "loading local model with exclusive VRAM access", len(pending),
+    )
+    failed = 0
+    provider = None
+    try:
+        # ASR workers exited, but Windows releases their VRAM asynchronously —
+        # wait until the model can actually fit before loading.
+        from src.translator.llm import LlmTranslator, wait_for_vram_release
+
+        wait_for_vram_release(LlmTranslator.minimum_free_vram_bytes())
+        provider = LlmTranslator()
+    except Exception as exc:
+        logger.error("Failed to initialize local translation model: %s", exc)
+        return len(pending)
+
+    for srt_path in pending:
+        if _shutdown_requested:
+            break
+        logger.info("LLM translating: %s → %s", srt_path.name, config.translate_to)
+        try:
+            translate_srt_with_outputs(
+                srt_path,
+                config.translate_to,
+                provider=provider,
+                source_lang=config.language,
+                swap_subtitles=config.swap_subtitles,
+            )
+        except Exception as exc:
+            failed += 1
+            logger.error("LLM translation failed for %s: %s", srt_path.name, exc)
+    # Give the VRAM back so the desktop / other tools get a clean GPU.
+    provider.release()
+    logger.info("LLM translation pass complete (%d failure(s))", failed)
+    return failed
+
+
 def _exit_code(*, failed_count: int, done_count: int, interrupted: bool) -> int:
     if interrupted:
         return 130
@@ -268,8 +346,8 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Split audio into N-second chunks (0=automatic chunking)")
     p.add_argument("--translate", default=None, metavar="LANG",
                    help="Auto-translate SRT to target language (ISO 639-1, e.g. zh)")
-    p.add_argument("--translator", default=None, choices=("bing", "gtx"),
-                   help="Translation backend (default: bing)")
+    p.add_argument("--translator", default=None, choices=("bing", "gtx", "llm"),
+                   help="Translation backend (default: bing; llm = local Hy-MT2 GGUF)")
     p.add_argument("--proxy", default=None, metavar="URL",
                    help="Proxy for Legacy GTX, e.g. 127.0.0.1:7897")
     p.add_argument("--verbose", action="store_true", help="Enable DEBUG logging")
@@ -387,6 +465,17 @@ def main():
         else:
             task_mgr.mark_failed(task.video_path, err)
             failed_count += 1
+
+    # --- Stage 4: local-LLM translation pass (after ASR) ---
+    # Run only when every video is transcribed, so the translation model can
+    # claim the free VRAM exclusively instead of competing with Whisper.
+    if (
+        config.translate_to
+        and config.translation_provider == "llm"
+        and not _shutdown_requested
+        and task_mgr.done_count == task_mgr.total_count
+    ):
+        failed_count += _run_llm_translation_pass(config)
 
     elapsed = time.time() - start_time
 

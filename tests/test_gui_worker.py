@@ -6,6 +6,7 @@ import pytest
 from PySide6.QtCore import QCoreApplication
 
 from src.gui import AsrWindow, PipelineWorker
+from src.task_manager import TaskManager
 from src.translator import TranslationError
 
 
@@ -37,7 +38,7 @@ def test_direct_srt_skips_translation_when_target_language_is_empty(tmp_path: Pa
     worker = PipelineWorker(
         [srt_path],
         {str(srt_path): "direct_srt"},
-        SimpleNamespace(translate_to=""),
+        SimpleNamespace(translate_to="", translation_provider="bing"),
         threading.Event(),
     )
     statuses: list[str] = []
@@ -107,6 +108,11 @@ def test_queue_summary_reports_asr_and_translation_stages():
     assert summary == "5 个文件  ·  ASR 待处理 1  ·  ASR 中 1  ·  翻译中 1  ·  待翻译 1  ·  完成 1"
 
 
+def test_log_color_treats_zero_failures_as_success():
+    assert AsrWindow._log_color("Transcription complete: 17 success, 0 failed (out of 17)") == "#9be1b0"
+    assert AsrWindow._log_color("Transcription complete: 16 success, 1 failed (out of 17)") == "#ff9b9b"
+
+
 def test_asr_continues_while_previous_subtitles_are_translating(tmp_path: Path, monkeypatch):
     first = tmp_path / "first.mp4"
     second = tmp_path / "second.mp4"
@@ -115,18 +121,21 @@ def test_asr_continues_while_previous_subtitles_are_translating(tmp_path: Path, 
     translation_started = threading.Event()
     second_asr_started = threading.Event()
     asr_calls: list[str] = []
+    translated_source_languages: list[str] = []
     statuses: list[tuple[str, str]] = []
     summaries: list[tuple[int, int, int, float, bool]] = []
 
     def fake_asr(config, media_path, **_kwargs):
         assert config.translate_to == ""
         asr_calls.append(media_path.name)
+        _kwargs["progress_callback"]("detected_language", "ko", "ko")
         if media_path == second:
             assert translation_started.wait(timeout=1)
             second_asr_started.set()
         return True, 12, ""
 
-    def fake_translate(_srt_path, *_args, **_kwargs):
+    def fake_translate(_srt_path, *_args, **kwargs):
+        translated_source_languages.append(kwargs["source_lang"])
         translation_started.set()
         assert second_asr_started.wait(timeout=1)
         return tmp_path / "translated.srt"
@@ -147,9 +156,25 @@ def test_asr_continues_while_previous_subtitles_are_translating(tmp_path: Path, 
     _flush_qt_events()
 
     assert asr_calls == ["first.mp4", "second.mp4"]
+    assert translated_source_languages == ["ko", "ko"]
     assert (str(first), "完成 · 已翻译") in statuses
     assert (str(second), "完成 · 已翻译") in statuses
     assert summaries[0][0:3] == (2, 2, 0)
+
+
+def test_auto_source_language_does_not_require_original_suffix_for_resume(tmp_path: Path):
+    manager = TaskManager(
+        tmp_path / "output",
+        output_formats=["srt"],
+        translate_to="zh",
+        swap_subtitles=True,
+        source_lang="auto",
+    )
+
+    assert manager._expected_output_names("movie") == [
+        "movie.bilingual.srt",
+        "movie.srt",
+    ]
 
 
 def test_translation_failure_does_not_block_later_asr_or_translation(tmp_path: Path, monkeypatch):

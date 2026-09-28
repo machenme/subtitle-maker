@@ -39,7 +39,7 @@ video_extensions:
 output_formats:                   # Formats to generate
   - srt
 translate_to: "zh"                  # Auto-translate SRT to language ("" = skip)
-translation_provider: "bing"        # bing | gtx
+translation_provider: "bing"        # bing | gtx | llm（llm = 本地 Hy-MT2 GGUF 模型，离线翻译）
 translation_proxy: ""               # Required by gtx, e.g. http://127.0.0.1:7897
 swap_subtitles: true               # Rename translated → .srt, original → .{lang}.srt
 

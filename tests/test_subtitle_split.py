@@ -119,6 +119,30 @@ def test_japanese_sentences_split_on_japanese_punctuation():
     ]
 
 
+def test_multilingual_subtitle_quality_constraints():
+    samples = [
+        ("zh", "这是第一句中文字幕。这里是第二句中文内容！", 15),
+        ("ja", "これは最初の字幕です。次の文も読みやすく分けます！", 12),
+        ("en", "This is the first English subtitle. Here is the next sentence!", 17),
+    ]
+
+    for language, text, max_cps in samples:
+        set_cps_language(language)
+        original = Segment(0.0, 30.0, text)
+        subtitles = TextFormatter.split_for_srt([original])
+
+        assert len(subtitles) >= 2
+        assert all(subtitle.text for subtitle in subtitles)
+        assert all(subtitle.end > subtitle.start for subtitle in subtitles)
+        assert all(len(subtitle.text) <= 40 for subtitle in subtitles)
+        assert all(subtitle.end <= original.end for subtitle in subtitles)
+        assert all(subtitle.end - subtitle.start <= 7.0 for subtitle in subtitles)
+        assert all(
+            len(subtitle.text) / (subtitle.end - subtitle.start) <= max_cps
+            for subtitle in subtitles
+        )
+
+
 if __name__ == "__main__":
     import subprocess, sys
     subprocess.run([sys.executable, "-m", "pytest", __file__, "-v"])
