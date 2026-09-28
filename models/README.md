@@ -1,4 +1,6 @@
-# models/ — 模型存放目录（不进 git）
+# models/ — model storage directory (not tracked by git)
+
+English docs: [../README.md](../README.md) · 中文说明：[../README_CN.md](../README_CN.md)
 
 这个目录**整体被 git 忽略**，仓库里只留这个占位说明。模型请自行下载，体积较大。
 
