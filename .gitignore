@@ -1,5 +1,7 @@
 # Built desktop launcher
-ASR-Pipeline.exe
+# NOTE: ASR-Pipeline.exe is tracked on purpose so a fresh clone can run the GUI
+# without building. Rebuild it with launcher\build_exe.bat after changing the
+# launcher sources — the binary must be re-committed by hand.
 *.spec
 
 # Python
