@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-ASR Pipeline desktop UI built with PySide6.
+Subtitle Maker desktop UI built with PySide6.
 
 The transcription engine remains in the existing Python modules. This module
 only owns the desktop presentation, user input, and worker-thread signals.
@@ -284,8 +284,8 @@ LOG_CARD_COLLAPSED = 104
 LOG_VIEW_COLLAPSED = 58
 LOG_VIEW_EXPANDED = 280
 # Window geometry persistence.
-SETTINGS_ORG = "ASR Pipeline"
-SETTINGS_APP = "ASR Pipeline"
+SETTINGS_ORG = "Subtitle Maker"
+SETTINGS_APP = "Subtitle Maker"
 
 
 def _card(title: str, subtitle: str = "") -> tuple[QFrame, QVBoxLayout]:
@@ -755,7 +755,7 @@ class PipelineWorker(QObject):
 class AsrWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("ASR Pipeline")
+        self.setWindowTitle("Subtitle Maker")
         self.setMinimumSize(960, 620)
         self.setAcceptDrops(True)
         self._restore_geometry()
@@ -776,7 +776,7 @@ class AsrWindow(QMainWindow):
         self._load_config()
         self._build_ui()
         self._start_gpu_monitor()
-        self._append_log("ASR Pipeline 已启动。拖入音视频或点击“选择文件”开始。")
+        self._append_log("Subtitle Maker 已启动。拖入音视频或点击“选择文件”开始。")
 
     def _restore_geometry(self) -> None:
         saved = QSettings(SETTINGS_ORG, SETTINGS_APP).value("geometry")
@@ -841,7 +841,7 @@ class AsrWindow(QMainWindow):
         layout.setContentsMargins(20, 10, 20, 10)
         title_box = QVBoxLayout()
         title_box.setSpacing(0)
-        title = QLabel("ASR Pipeline")
+        title = QLabel("Subtitle Maker")
         title.setObjectName("title")
         subtitle = QLabel("音视频转写 · 本地 GPU 加速 · SRT / TXT / Markdown")
         subtitle.setObjectName("subtitle")
@@ -1836,7 +1836,7 @@ class AsrWindow(QMainWindow):
 
 def main() -> None:
     app = QApplication(sys.argv)
-    app.setApplicationName("ASR Pipeline")
+    app.setApplicationName("Subtitle Maker")
     app.setStyle("Fusion")
     app.setStyleSheet(APP_STYLE)
     window = AsrWindow()

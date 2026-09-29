@@ -38,7 +38,7 @@ wheels = [
 ]
 
 [[package]]
-name = "asr-pipeline"
+name = "subtitle-maker"
 version = "1.0.0"
 source = { virtual = "." }
 dependencies = [

@@ -1,22 +1,22 @@
 @echo off
-rem Build the double-clickable ASR-Pipeline.exe launcher (no console window).
+rem Build the double-clickable Subtitle-Maker.exe launcher (no console window).
 rem Requires: .venv\Scripts\python.exe with pyinstaller installed (uv sync --group dev)
 pushd "%~dp0.."
 
 .venv\Scripts\python.exe -m PyInstaller ^
     --noconfirm --clean --onefile --windowed --noupx ^
-    --name ASR-Pipeline ^
+    --name Subtitle-Maker ^
     --distpath dist ^
     --workpath build ^
     --specpath launcher ^
-    launcher\asr_launcher.py
+    launcher\subtitle_maker_launcher.py
 
 if errorlevel 1 goto :fail
 
-if not exist dist\ASR-Pipeline.exe goto :fail
-copy /Y dist\ASR-Pipeline.exe ASR-Pipeline.exe >nul
+if not exist dist\Subtitle-Maker.exe goto :fail
+copy /Y dist\Subtitle-Maker.exe Subtitle-Maker.exe >nul
 echo.
-echo Built: %CD%\ASR-Pipeline.exe
+echo Built: %CD%\Subtitle-Maker.exe
 popd
 exit /b 0
 

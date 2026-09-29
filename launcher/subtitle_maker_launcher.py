@@ -1,4 +1,4 @@
-"""Headless launcher for the ASR Pipeline GUI.
+"""Headless launcher for the Subtitle Maker GUI.
 
 Double-clickable replacement for 一键启动.bat: it starts the PySide6 GUI out
 of the project virtual environment and never flashes a console window.
@@ -8,7 +8,7 @@ upgrade needs no rebuild — only this launcher would need rebuilding if the
 interpreter lookup below ever changes.
 
 Debug: stdout/stderr of the GUI are appended to <project>/logs/gui.log. Set
-ASR_PIPELINE_NOWAIT=1 to skip the 2s startup sanity check.
+SUBTITLE_MAKER_NOWAIT=1 to skip the 2s startup sanity check.
 """
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ def find_interpreter(root: Path) -> list[str] | None:
 
 
 def show_error(message: str) -> None:
-    ctypes.windll.user32.MessageBoxW(0, message, "ASR Pipeline 启动失败", 0x10)
+    ctypes.windll.user32.MessageBoxW(0, message, "Subtitle Maker 启动失败", 0x10)
 
 
 def read_tail(path: Path, lines: int) -> str:
@@ -65,7 +65,7 @@ def read_tail(path: Path, lines: int) -> str:
 def nowait_requested() -> bool:
     # os.environ rather than sys.environ: sys.environ is unavailable inside the
     # frozen bundle produced by PyInstaller --windowed.
-    return os.environ.get("ASR_PIPELINE_NOWAIT") == "1"
+    return os.environ.get("SUBTITLE_MAKER_NOWAIT") == "1"
 
 
 def main() -> int:

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-ASR Pipeline CLI — end-to-end speech-to-text for audio and video files.
+Subtitle Maker CLI — end-to-end speech-to-text for audio and video files.
 
 Usage:
     uv run python -m src.main --input ./videos --output ./subtitles
@@ -325,7 +325,7 @@ def _exit_code(*, failed_count: int, done_count: int, interrupted: bool) -> int:
 
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="asr-pipeline",
+        prog="subtitle-maker",
         description="Offline batch Japanese audio/video speech-to-text with GPU parallel inference.",
     )
     # Required

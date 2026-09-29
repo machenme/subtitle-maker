@@ -1,5 +1,5 @@
 [project]
-name = "asr-pipeline"
+name = "subtitle-maker"
 version = "1.0.0"
 description = "Offline batch video speech-to-text pipeline with GPU parallel inference + SRT translation"
 requires-python = ">=3.11,<3.13"

@@ -1,4 +1,4 @@
-# ASR Pipeline — 视频语音转文字并行处理管线
+# Subtitle Maker — 视频语音转文字并行处理管线
 
 [English](README.md) | [简体中文](README_CN.md)
 
@@ -9,7 +9,7 @@
 ## 特性
 
 - **PySide6 图形界面** — 拖拽音视频/SRT、选翻译语言、实时日志、GPU 监控，零命令行操作
-- **无控制台启动器** — 双击 `ASR-Pipeline.exe` 直接开界面，不再经过命令行窗口
+- **无控制台启动器** — 双击 `Subtitle-Maker.exe` 直接开界面，不再经过命令行窗口
 - **队列即拖放区** — 有文件时上方的拖放区自动隐藏，音视频 / SRT / 整个文件夹直接拖到队列任意位置即可入列
 - **语言自动检测** — 默认自动识别视频语言，支持手动指定 14 种语言
 - **GPU 多路并行** — spawn 独立进程，每进程常驻一个 WhisperModel，启动时逐个试探可用并发
@@ -74,17 +74,15 @@ git clone https://huggingface.co/deepdml/faster-whisper-large-v3-turbo-ct2
 
 ### 桌面启动器（不用开命令行）
 
-双击项目根目录的 `ASR-Pipeline.exe` 即可打开界面，效果与上面的命令完全一致，但**不会弹出任何控制台窗口**。
+可将构建好的 `Subtitle-Maker.exe` 放到项目根目录：双击即可打开界面，**不会弹出任何控制台窗口**。自行构建（升级依赖或改动 `launcher/` 后执行）：
 
 ```bash
-# 重新构建（升级依赖或改动 launcher/ 后执行）
+# 需先 `uv sync --group dev` 装好 PyInstaller
 launcher\build_exe.bat
 ```
 
 启动器（约 8 MB）只负责拉起 GUI，程序本体仍在源码树里运行，因此升级依赖**不需要重新打包**。
 启动失败会弹窗提示，详细输出追加到 `logs\gui.log`；想跟踪日志就盯着这个文件。
-
-> 需要 `uv sync --group dev` 装好 PyInstaller 才能重建。
 
 ### 图形界面（推荐）
 
@@ -334,7 +332,7 @@ Whisper 模型：只有模型成功加载且显存仍至少保留 2.5 GiB 推理
 ## 项目结构
 
 ```
-video-to-text/
+subtitle-maker/
 ├── src/
 │   ├── gui.py                # PySide6 图形界面入口
 │   ├── main.py               # CLI 入口，流程编排，信号处理
@@ -352,7 +350,7 @@ video-to-text/
 ├── output/                  # 输出目录（默认即视频所在目录）
 │   ├── {video_name}.srt
 │   └── ...
-├── ASR-Pipeline.exe         # 双击即用的桌面启动器
+├── Subtitle-Maker.exe         # 双击即用的桌面启动器
 ├── config.yaml              # 默认配置
 ├── pyproject.toml           # uv 项目配置
 ├── uv.lock                  # 锁定的依赖版本（可复现构建）

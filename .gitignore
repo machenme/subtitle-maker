@@ -1,5 +1,5 @@
 # Built desktop launcher
-# NOTE: ASR-Pipeline.exe is tracked on purpose so a fresh clone can run the GUI
+# NOTE: Subtitle-Maker.exe is tracked on purpose so a fresh clone can run the GUI
 # without building. Rebuild it with launcher\build_exe.bat after changing the
 # launcher sources — the binary must be re-committed by hand.
 *.spec

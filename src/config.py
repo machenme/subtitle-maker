@@ -241,7 +241,7 @@ class PipelineConfig:
         if self.temp_dir:
             return self.temp_dir
         import tempfile
-        return Path(tempfile.gettempdir()) / "asr-pipeline-temp" / str(os.getpid())
+        return Path(tempfile.gettempdir()) / "subtitle-maker-temp" / str(os.getpid())
 
     def __repr__(self) -> str:
         lines = ["PipelineConfig:"]

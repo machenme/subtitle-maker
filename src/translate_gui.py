@@ -4,7 +4,7 @@ Standalone subtitle translation UI built with PySide6.
 
 Drag SRT files in, pick a backend (Microsoft Edge / Legacy GTX / local
 Hy-MT2 GGUF model) and target language, then translate without running
-the ASR pipeline.
+the Subtitle Maker pipeline.
 
 Usage:
     uv run python -m src.translate_gui

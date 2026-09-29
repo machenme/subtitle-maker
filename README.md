@@ -1,4 +1,4 @@
-# ASR Pipeline — Parallel Speech-to-Text for Video and Audio
+# Subtitle Maker — Parallel Speech-to-Text for Video and Audio
 
 [English](README.md) | [简体中文](README_CN.md)
 
@@ -9,7 +9,7 @@ Input covers common video containers plus `m4a`, `mp3`, `wav`, `flac`, `ogg`, `o
 ## Features
 
 - **PySide6 desktop UI** — drag in audio/video/SRT, pick a target language, watch the live log and GPU monitor, no command line needed
-- **Console-less launcher** — double-click `ASR-Pipeline.exe` and the UI opens without any terminal window flashing up
+- **Console-less launcher** — double-click `Subtitle-Maker.exe` and the UI opens without any terminal window flashing up
 - **The queue is a drop target** — the drop zone hides itself once you have files; drag audio/video, SRT files or a whole folder onto any part of the queue table to enqueue them
 - **Language auto-detection** — detects the spoken language by default, or pin any of 14 languages manually
 - **Multi-stream GPU parallelism** — spawns independent processes, each holding a resident `WhisperModel`, probing the safe concurrency at startup
@@ -82,16 +82,14 @@ See [models/README.md](models/README.md) for other model sizes and exact directo
 
 ### Desktop launcher (no terminal)
 
-Double-click `ASR-Pipeline.exe` in the project root. It does exactly what the command below does, but **never shows a console window**.
+A prebuilt `Subtitle-Maker.exe` can be dropped in the project root: double-click it and the GUI opens with **no console window**. Build it yourself (after changing `launcher/` sources) with:
 
 ```bash
-# Rebuild it (after changing launcher/ sources)
+# Requires PyInstaller: uv sync --group dev
 launcher\build_exe.bat
 ```
 
 The launcher (~8 MB) only starts the GUI; the application still runs from the source tree, so upgrading dependencies does **not** require repackaging. Startup failures pop up an error box and everything is appended to `logs\gui.log`.
-
-> Rebuilding needs PyInstaller: `uv sync --group dev`.
 
 ### GUI (recommended)
 
@@ -335,7 +333,7 @@ Timestamps are second-accurate, which makes manual proofreading easy to locate.
 ## Project structure
 
 ```
-video-to-text/
+subtitle-maker/
 ├── src/
 │   ├── gui.py                # PySide6 desktop UI entry point
 │   ├── main.py               # CLI entry point, orchestration, signal handling
@@ -353,7 +351,7 @@ video-to-text/
 ├── output/                   # Output directory (defaults to the video's own folder)
 │   ├── {video_name}.srt
 │   └── ...
-├── ASR-Pipeline.exe          # Double-click desktop launcher
+├── Subtitle-Maker.exe        # Double-click desktop launcher
 ├── config.yaml               # Default configuration
 ├── pyproject.toml            # uv project metadata
 ├── uv.lock                   # Locked dependency versions (reproducible builds)
