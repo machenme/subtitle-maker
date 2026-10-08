@@ -19,6 +19,15 @@ logger = logging.getLogger(__name__)
 # Read first + last N bytes for file fingerprint
 _HEAD_TAIL_BYTES = 10 * 1024 * 1024  # 10 MB
 
+# Fingerprint memo: (size, mtime_ns) -> fingerprint dict. Computing a
+# fingerprint reads 20 MB and spawns an ffprobe subprocess (~145 ms), while a
+# stat() costs ~0.01 ms. Keying on stat output lets repeated calls for an
+# unchanged file (build_queue, then mark_done) reuse the earlier result while
+# still recomputing whenever the file actually changes.
+_FINGERPRINT_CACHE: dict[tuple, dict] = {}
+# Bound the memo so a long batch over a huge library cannot grow it without end.
+_FINGERPRINT_CACHE_MAX = 4096
+
 
 def _file_fingerprint(path: Path) -> dict | None:
     """Return ``{size, mtime, head_tail_hash, duration}`` or None."""
@@ -26,7 +35,25 @@ def _file_fingerprint(path: Path) -> dict | None:
         stat = path.stat()
         size = stat.st_size
         mtime = int(stat.st_mtime)
+        cache_key = (str(path), size, stat.st_mtime_ns)
+    except OSError:
+        return None
 
+    cached = _FINGERPRINT_CACHE.get(cache_key)
+    if cached is not None:
+        return dict(cached)
+
+    result = _compute_fingerprint(path, size, mtime)
+    if result is not None:
+        if len(_FINGERPRINT_CACHE) >= _FINGERPRINT_CACHE_MAX:
+            _FINGERPRINT_CACHE.clear()
+        _FINGERPRINT_CACHE[cache_key] = result
+    return dict(result) if result is not None else None
+
+
+def _compute_fingerprint(path: Path, size: int, mtime: int) -> dict | None:
+    """Do the actual 20 MB read + ffprobe probe for an uncached file."""
+    try:
         dur = 0.0
         try:
             import subprocess as _sp

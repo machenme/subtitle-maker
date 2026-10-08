@@ -21,12 +21,23 @@ def scan_video_files(
     Returns a sorted list of absolute paths.
     """
     ext_set = {e.lower().lstrip(".") for e in extensions}
-    pattern = "*" if recursive else "[!.]*"
-    results: list[Path] = []
+    if not ext_set:
+        return []
 
-    for ext in ext_set:
-        glob_pattern = f"**/{pattern}.{ext}" if recursive else f"{pattern}.{ext}"
-        results.extend(directory.glob(glob_pattern))
+    # One walk instead of one glob per extension: the previous version walked
+    # the whole tree once per extension (14x for the default set).
+    results: list[Path] = []
+    if recursive:
+        for dir_path, dir_names, file_names in os.walk(directory):
+            # Do not descend into symlinked dirs — they can form cycles.
+            dir_names[:] = [d for d in dir_names if not (Path(dir_path) / d).is_symlink()]
+            for file_name in file_names:
+                if file_name.rpartition(".")[2].lower() in ext_set:
+                    results.append(Path(dir_path) / file_name)
+    else:
+        pattern = "[!.]*"
+        for ext in ext_set:
+            results.extend(directory.glob(f"{pattern}.{ext}"))
 
     # Deduplicate and sort
     seen: set[Path] = set()
