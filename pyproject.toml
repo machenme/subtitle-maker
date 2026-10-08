@@ -1,6 +1,6 @@
 [project]
 name = "subtitle-maker"
-version = "1.0.0"
+version = "1.1.0"
 description = "Offline batch video speech-to-text pipeline with GPU parallel inference + SRT translation"
 requires-python = ">=3.11,<3.13"
 dependencies = [

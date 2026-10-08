@@ -17,9 +17,13 @@ import yaml
 # ---------------------------------------------------------------------------
 
 DEFAULT_MODEL_PATH = "./models/faster-whisper-large-v3-turbo-ct2"
+# Default GGUF location for translation_provider="llm". Kept in sync with
+# src.translator.llm.DEFAULT_MODEL_PATH (duplicated deliberately: importing
+# the translator here would create a cycle, since it depends on this module).
+DEFAULT_TRANSLATION_MODEL_PATH = "./models/index-translate-9b"
 VALID_MODEL_SIZES = {"large-v3-turbo", "large-v3", "medium"}
 DEFAULT_MAX_WORKERS = 16
-VALID_TRANSLATION_PROVIDERS = {"bing", "gtx", "llm"}
+VALID_TRANSLATION_PROVIDERS = {"bing", "gtx", "index_api", "llm"}
 
 
 def _default_model_path(model_size: str) -> str:
@@ -74,6 +78,10 @@ class PipelineConfig:
     translate_to: str = "zh"  # "" = skip translation; non-empty = ISO 639-1 target
     translation_provider: str = "bing"
     translation_proxy: str = ""
+    # GGUF weights for translation_provider="llm". Accepts a directory holding
+    # one .gguf or the .gguf file itself; "" = use DEFAULT_TRANSLATION_MODEL_PATH.
+    # Lets users point at their own quantized Index-Translate / Hy-MT2 build.
+    translation_model_path: str = ""
     swap_subtitles: bool = True  # write translated .srt, bilingual, and original subtitles
     cleanup_temp: bool = True
     verbose: bool = False
@@ -164,6 +172,11 @@ class PipelineConfig:
             if cli.get("translation_proxy") is not None
             else raw.get("translation_proxy", "")
         )
+        translation_model_path = (
+            cli.get("translation_model_path")
+            if cli.get("translation_model_path") is not None
+            else raw.get("translation_model_path", "")
+        )
         swap_subtitles = cli.get("swap_subtitles", raw.get("swap_subtitles", True))
         cleanup_temp = cli.get("cleanup_temp", raw.get("cleanup_temp", True))
         verbose = cli.get("verbose", raw.get("verbose", False))
@@ -185,6 +198,7 @@ class PipelineConfig:
             translate_to=translate_to,
             translation_provider=translation_provider,
             translation_proxy=translation_proxy,
+            translation_model_path=translation_model_path,
             swap_subtitles=swap_subtitles,
             cleanup_temp=cleanup_temp,
             verbose=verbose,
@@ -227,6 +241,20 @@ class PipelineConfig:
                 "translation_provider must be one of "
                 f"{sorted(VALID_TRANSLATION_PROVIDERS)}, got {self.translation_provider}"
             )
+        # A custom translation model is only meaningful for the local backend,
+        # and it must actually point at a readable .gguf.
+        if self.translation_model_path and self.translation_provider != "llm":
+            errors.append(
+                "translation_model_path only applies to translation_provider='llm', "
+                f"got {self.translation_provider!r}"
+            )
+        if self.translation_provider == "llm":
+            errors.extend(self._validate_translation_model_path())
+        if self.translation_provider == "index_api" and not self.translation_proxy:
+            errors.append(
+                "translation_provider='index_api' needs translation_proxy "
+                "(e.g. 127.0.0.1:7897) to reach the public endpoint"
+            )
 
         if errors:
             raise ValueError("Configuration errors:\n  - " + "\n  - ".join(errors))
@@ -234,6 +262,40 @@ class PipelineConfig:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _validate_translation_model_path(self) -> list[str]:
+        """Check the custom translation GGUF path.
+
+        Mirrors :func:`src.translator.llm._resolve_gguf`: a directory must
+        contain at least one ``*.gguf``. Reported early (at config time) so a
+        typo surfaces in the GUI instead of minutes later during model load.
+        """
+        raw = (self.translation_model_path or "").strip()
+        if not raw:
+            # Empty = the default bundled location; only validate when present.
+            default = Path(DEFAULT_TRANSLATION_MODEL_PATH)
+            if not (default.is_dir() or default.is_file()):
+                return [
+                    f"Default translation model not found: {default}. "
+                    "Set translation_model_path to your own .gguf file."
+                ]
+            if default.is_dir() and not any(default.glob("*.gguf")):
+                return [f"No .gguf file in default translation model dir: {default}"]
+            return []
+
+        path = Path(raw)
+        if path.is_file():
+            if path.suffix.lower() != ".gguf":
+                return [f"translation_model_path must be a .gguf file: {path}"]
+            return []
+        if path.is_dir():
+            if not any(path.glob("*.gguf")):
+                return [f"No .gguf file in translation_model_path: {path}"]
+            return []
+        return [
+            f"translation_model_path does not exist: {path} "
+            "(expected a .gguf file or a directory containing one)"
+        ]
 
     @property
     def effective_temp_dir(self) -> Path:

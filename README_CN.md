@@ -106,6 +106,10 @@ Microsoft Edge Translator 接口无需 API Key；每批默认发送 50 条字幕
 
 Legacy GTX 翻译接口使用 `translate.googleapis.com/translate_a/t`，每批字幕通过换行合并为一次请求。该接口需要代理，GUI 选择“Legacy GTX (免费)”时会提示输入代理，例如 `127.0.0.1:7897`。
 
+**Index-Translate 官方 API**（`index_api`）免费提供 `Index-Translate-35B-A3B` 模型，强度高于本地 9B；Key 任意填写即可。**字幕文本会发往 `index-translate.bilibili.com`**，且该接口需代理才能连通。
+
+**本地模型**（`llm`）完全离线，用 GGUF 权重在本机翻译。可在界面的「本地模型」输入框指定自己的量化版本（目录或 `.gguf` 文件均可），留空则用 `models/index-translate-9b/` 里的默认权重。量化选型实测见 `models/README.md`。
+
 ### 命令行 — 转写 + 翻译
 
 ```bash
@@ -149,8 +153,8 @@ translate_srt('demo.srt', 'zh', provider=EdgeTranslator())
 | `--no-vad` | flag | false | 禁用 VAD 语音检测 |
 | `--no-cleanup` | flag | false | 保留临时音频文件 |
 | `--translate` | str | — | 翻译目标语言（如 zh / en / ko），不指定则不翻译 |
-| `--translator` | str | `bing` | 翻译后端：`bing` / `gtx` |
-| `--proxy` | URL | — | Legacy GTX 代理，例如 `127.0.0.1:7897` |
+| `--translator` | str | `bing` | 翻译后端：`bing` / `gtx` / `index_api` / `llm` |
+| `--proxy` | URL | — | GTX / index_api 代理，例如 `127.0.0.1:7897` |
 | `--verbose` | flag | false | 输出 DEBUG 级日志 |
 | `--force` | flag | false | 忽略断点续跑，强制全部重跑 |
 

@@ -3,7 +3,7 @@
 Standalone subtitle translation UI built with PySide6.
 
 Drag SRT files in, pick a backend (Microsoft Edge / Legacy GTX / local
-Hy-MT2 GGUF model) and target language, then translate without running
+Index-Translate GGUF model) and target language, then translate without running
 the Subtitle Maker pipeline.
 
 Usage:
@@ -11,7 +11,6 @@ Usage:
 """
 from __future__ import annotations
 
-import html
 import logging
 import sys
 import threading
@@ -21,13 +20,11 @@ if __name__ == "__main__" and str(Path(__file__).resolve().parent.parent) not in
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from PySide6.QtCore import QObject, QThread, Qt, Signal
-from PySide6.QtGui import QDragEnterEvent, QDropEvent, QFont
+from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
-    QComboBox,
     QFileDialog,
-    QFrame,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -35,9 +32,9 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QProgressBar,
+    QStackedLayout,
     QTableWidget,
     QTableWidgetItem,
-    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -49,95 +46,18 @@ from src.translator import (
     parse_srt,
     translate_srt_with_outputs,
 )
+from src.ui_theme import (
+    APP_STYLE,
+    CheckBox,
+    ChevronComboBox,
+    DropZone,
+    inline,
+    panel,
+    section,
+    status_colors,
+)
 
 
-APP_STYLE = """
-QWidget {
-    background: #f4f7fb;
-    color: #1f2d43;
-    font-family: "Microsoft YaHei UI", "Segoe UI";
-    font-size: 10pt;
-}
-QMainWindow { background: #f4f7fb; }
-QLabel, QCheckBox { background: transparent; }
-QFrame#card {
-    background: #ffffff;
-    border: 1px solid #e3eaf3;
-    border-radius: 8px;
-}
-QFrame#dropZone {
-    background: #f8fbff;
-    border: 1px dashed #9db8d8;
-    border-radius: 8px;
-}
-QFrame#dropZone:hover { background: #f0f7ff; border-color: #2f76c7; }
-QLabel#title { color: #183153; font-size: 20pt; font-weight: 700; }
-QLabel#subtitle { color: #607590; font-size: 10pt; }
-QLabel#sectionTitle { color: #263b59; font-size: 11pt; font-weight: 700; }
-QLabel#muted { color: #52677f; }
-QLabel#dropTitle { color: #28476e; font-size: 12pt; font-weight: 600; }
-QLabel#dropHint { color: #7b8da5; }
-QLineEdit, QComboBox {
-    background: #ffffff;
-    border: 1px solid #d5dfeb;
-    border-radius: 7px;
-    padding: 7px 9px;
-    min-height: 18px;
-}
-QLineEdit:focus, QComboBox:focus { border: 1px solid #4f91d3; }
-QPushButton {
-    background: #ffffff;
-    border: 1px solid #d3deeb;
-    border-radius: 7px;
-    padding: 8px 13px;
-    color: #314967;
-}
-QPushButton:hover { background: #edf5fe; border-color: #9fc4e8; }
-QPushButton:disabled { color: #a7b3c2; background: #f2f5f8; }
-QPushButton#primary {
-    background: #2f76c7;
-    border-color: #2f76c7;
-    color: #ffffff;
-    font-weight: 700;
-    padding: 9px 18px;
-}
-QPushButton#primary:hover { background: #2567b1; }
-QPushButton#danger { color: #b14d4d; }
-QTableWidget {
-    background: #ffffff;
-    alternate-background-color: #f8fafc;
-    border: 0;
-    gridline-color: #edf1f6;
-    selection-background-color: #e6f1ff;
-    selection-color: #1f2d43;
-}
-QHeaderView::section {
-    background: #f5f8fc;
-    color: #72839a;
-    border: 0;
-    border-bottom: 1px solid #e5ebf2;
-    padding: 9px 8px;
-    font-weight: 600;
-}
-QProgressBar {
-    background: #e8eef5;
-    border: 0;
-    border-radius: 5px;
-    text-align: center;
-    color: #ffffff;
-    min-height: 10px;
-    max-height: 10px;
-}
-QProgressBar::chunk { background: #3b82c4; border-radius: 5px; }
-QTextEdit {
-    background: #172235;
-    border: 0;
-    border-radius: 8px;
-    color: #d9e4f1;
-    padding: 8px;
-}
-QCheckBox { spacing: 7px; color: #425873; }
-"""
 
 SOURCE_LANGUAGE_MAP = {
     "自动检测": "auto",
@@ -169,7 +89,7 @@ TARGET_LANGUAGE_MAP = {
 BACKEND_MAP = {
     "Microsoft Edge Translator (免费·联网)": "bing",
     "Legacy GTX (免费·联网·需代理)": "gtx",
-    "本地 Hy-MT2 模型 (离线·GGUF)": "llm",
+    "本地 Index-Translate 模型 (离线·GGUF)": "llm",
 }
 
 
@@ -251,16 +171,32 @@ class TranslateWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("字幕翻译工具")
-        self.setMinimumSize(760, 620)
-        self.resize(860, 700)
+        self.setMinimumSize(720, 520)
+        self.resize(860, 640)
+        self.setAcceptDrops(True)
 
         self.paths: list[Path] = []
-        self._row_by_path: dict[str, int] = {}
+        self._row_by_path: dict[str, str] = {}
         self._cancel = threading.Event()
         self._thread: QThread | None = None
         self._worker: TranslationWorker | None = None
         self._is_running = False
         self._build_ui()
+        self._refresh_queue_view()
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802 - Qt API naming
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event: QDropEvent) -> None:  # noqa: N802 - Qt API naming
+        paths = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
+        if paths:
+            self._add_paths(paths)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
 
     # ------------------------------------------------------------------
     # UI construction
@@ -269,63 +205,121 @@ class TranslateWindow(QMainWindow):
     def _build_ui(self) -> None:
         root = QWidget()
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(18, 16, 18, 14)
+        layout.setContentsMargins(20, 16, 20, 12)
         layout.setSpacing(12)
 
+        # Flat masthead, same shape as the main window.
+        header = QWidget()
+        head = QHBoxLayout(header)
+        head.setContentsMargins(4, 0, 4, 0)
         title_box = QVBoxLayout()
-        title_box.setSpacing(2)
+        title_box.setSpacing(1)
         title = QLabel("字幕翻译工具")
-        title.setObjectName("title")
-        subtitle = QLabel("拖入 SRT 字幕直接翻译 · 支持 Edge / GTX / 本地 Hy-MT2 模型")
-        subtitle.setObjectName("subtitle")
+        title.setObjectName("appTitle")
+        subtitle = QLabel("拖入 SRT 直接翻译 · Edge / GTX / 本地 Index-Translate 模型")
+        subtitle.setObjectName("appSubtitle")
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
-        layout.addLayout(title_box)
+        head.addLayout(title_box)
+        head.addStretch()
+        layout.addWidget(header)
 
-        layout.addWidget(self._build_drop_card())
-        layout.addWidget(self._build_settings_card(), 0, Qt.AlignmentFlag.AlignTop)
-        layout.addWidget(self._build_queue_card(), 1)
-        layout.addWidget(self._build_footer())
+        layout.addWidget(self._build_settings_section())
+        layout.addWidget(self._build_queue_panel(), 1)
+        layout.addWidget(self._build_action_bar())
         self.setCentralWidget(root)
 
-    def _card(self, title: str) -> tuple[QFrame, QVBoxLayout]:
-        card = QFrame()
-        card.setObjectName("card")
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(16, 14, 16, 14)
-        layout.setSpacing(10)
-        heading = QLabel(title)
-        heading.setObjectName("sectionTitle")
-        layout.addWidget(heading)
-        return card, layout
+    def _build_settings_section(self) -> QWidget:
+        """One borderless block: three choices, all of which are required."""
+        holder, layout = section("翻译设置")
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(7)
+        grid.setColumnMinimumWidth(0, 58)
+        grid.setColumnStretch(1, 1)
 
-    def _build_drop_card(self) -> QFrame:
-        card, layout = self._card("输入文件")
-        zone = QFrame()
-        zone.setObjectName("dropZone")
-        zone.setAcceptDrops(True)
-        zone.setMinimumHeight(110)
-        zone.dropEvent = self._drop_event  # type: ignore[method-assign]
-        zone.dragEnterEvent = self._drag_enter_event  # type: ignore[method-assign]
-        zone_layout = QVBoxLayout(zone)
-        zone_layout.setContentsMargins(12, 10, 12, 12)
-        zone_layout.setSpacing(4)
-        drop_title = QLabel("拖放 SRT 文件到此处")
-        drop_title.setObjectName("dropTitle")
-        drop_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        drop_hint = QLabel("也可点击下方“选择文件”按钮")
-        drop_hint.setObjectName("dropHint")
-        drop_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        zone_layout.addWidget(drop_title)
-        zone_layout.addWidget(drop_hint)
-        layout.addWidget(zone)
+        self.backend_combo = ChevronComboBox()
+        self.backend_combo.addItems(list(BACKEND_MAP))
+        self.source_combo = ChevronComboBox()
+        self.source_combo.addItems(list(SOURCE_LANGUAGE_MAP))
+        self.source_combo.setCurrentText("自动检测")
+        self.target_combo = ChevronComboBox()
+        self.target_combo.addItems(list(TARGET_LANGUAGE_MAP))
+        self.swap_check = CheckBox("生成单语译文、双语字幕和原始字幕")
+        self.swap_check.setChecked(True)
+
+        for row, (label, widget) in enumerate((
+            ("后端", self.backend_combo),
+            ("源语言", self.source_combo),
+            ("目标语言", self.target_combo),
+        )):
+            caption = QLabel(label)
+            caption.setObjectName("fieldLabel")
+            caption.setMinimumWidth(58)
+            grid.addWidget(caption, row, 0)
+            grid.addWidget(widget, row, 1)
+        layout.addLayout(grid)
+        # Without this the checkbox stretches to the full panel width, which
+        # reads as a selectable row instead of a checkbox.
+        layout.addWidget(inline(self.swap_check), 0, Qt.AlignmentFlag.AlignLeft)
+        self.backend_combo.currentTextChanged.connect(self._on_backend_changed)
+        return holder
+
+    def _build_queue_panel(self) -> QWidget:
+        """The one raised surface: intake empty state plus the queue table."""
+        card, layout = panel()
+
+        head = QHBoxLayout()
+        head.setSpacing(12)
+        caption = QLabel("翻译队列")
+        caption.setObjectName("sectionLabel")
+        self.queue_hint = QLabel("尚未添加文件")
+        self.queue_hint.setObjectName("faint")
+        head.addWidget(caption)
+        head.addWidget(self.queue_hint)
+        head.addStretch()
+        layout.addLayout(head)
+
+        self.drop_zone = DropZone(
+            title="拖放 SRT 文件到此处",
+            hint="也可点击下方“添加文件”按钮",
+            show_button=False,
+        )
+        self.drop_zone.files_dropped.connect(self._add_paths)
+        self.file_table = QTableWidget(0, 2)
+        self.file_table.setHorizontalHeaderLabels(["文件", "状态"])
+        self.file_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.file_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.file_table.setAlternatingRowColors(True)
+        self.file_table.verticalHeader().setVisible(False)
+        self.file_table.verticalHeader().setDefaultSectionSize(28)
+        self.file_table.verticalHeader().setMinimumSectionSize(28)
+        self.file_table.horizontalHeader().setStretchLastSection(False)
+        self.file_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.file_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        self.file_table.setColumnWidth(1, 84)
+
+        empty_host = QWidget()
+        empty_layout = QVBoxLayout(empty_host)
+        empty_layout.setContentsMargins(0, 0, 0, 0)
+        empty_layout.addStretch()
+        empty_layout.addWidget(self.drop_zone)
+        empty_layout.addStretch()
+        stack_host = QWidget()
+        self.queue_stack = QStackedLayout(stack_host)
+        self.queue_stack.setContentsMargins(0, 0, 0, 0)
+        self.queue_stack.addWidget(empty_host)
+        self.queue_stack.addWidget(self.file_table)
+        layout.addWidget(stack_host, 1)
 
         actions = QHBoxLayout()
-        add_button = QPushButton("选择文件")
+        actions.setSpacing(8)
+        add_button = QPushButton("添加文件")
         add_button.clicked.connect(self._choose_files)
         remove_button = QPushButton("移除选中")
         remove_button.clicked.connect(self._remove_selected)
         clear_button = QPushButton("清空")
+        clear_button.setObjectName("link")
         clear_button.clicked.connect(self._clear_files)
         actions.addWidget(add_button)
         actions.addWidget(remove_button)
@@ -337,85 +331,27 @@ class TranslateWindow(QMainWindow):
         self.clear_button = clear_button
         return card
 
-    def _build_settings_card(self) -> QFrame:
-        card, layout = self._card("翻译设置")
-        row = QHBoxLayout()
-        row.setSpacing(10)
+    def _build_action_bar(self) -> QWidget:
+        """Flat bar matching the main window: state left, commitment right."""
+        bar = QWidget()
+        layout = QVBoxLayout(bar)
+        layout.setContentsMargins(4, 10, 4, 0)
+        layout.setSpacing(8)
 
-        self.backend_combo = QComboBox()
-        self.backend_combo.addItems(list(BACKEND_MAP))
-        self.source_combo = QComboBox()
-        self.source_combo.addItems(list(SOURCE_LANGUAGE_MAP))
-        self.source_combo.setCurrentText("自动检测")
-        self.target_combo = QComboBox()
-        self.target_combo.addItems(list(TARGET_LANGUAGE_MAP))
-        self.swap_check = QCheckBox("生成单语译文、双语字幕和原始字幕")
-        self.swap_check.setChecked(True)
-
-        backend_label = QLabel("后端")
-        backend_label.setObjectName("muted")
-        source_label = QLabel("源语言")
-        source_label.setObjectName("muted")
-        target_label = QLabel("目标语言")
-        target_label.setObjectName("muted")
-        for widget in (self.backend_combo, self.source_combo, self.target_combo):
-            widget.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
-        row.addWidget(backend_label)
-        row.addWidget(self.backend_combo)
-        row.addSpacing(10)
-        row.addWidget(source_label)
-        row.addWidget(self.source_combo)
-        row.addSpacing(10)
-        row.addWidget(target_label)
-        row.addWidget(self.target_combo)
-        row.addStretch()
-        layout.addLayout(row)
-        layout.addWidget(self.swap_check)
-        self.backend_combo.currentTextChanged.connect(self._on_backend_changed)
-        return card
-
-    def _build_queue_card(self) -> QFrame:
-        card, layout = self._card("翻译队列")
-        self.file_table = QTableWidget(0, 2)
-        self.file_table.setHorizontalHeaderLabels(["文件", "状态"])
-        self.file_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.file_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.file_table.setAlternatingRowColors(True)
-        self.file_table.verticalHeader().setVisible(False)
-        self.file_table.horizontalHeader().setStretchLastSection(False)
-        self.file_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.file_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        layout.addWidget(self.file_table, 1)
-
-        self.log_edit = QTextEdit()
-        self.log_edit.setReadOnly(True)
-        self.log_edit.setFont(QFont("Consolas", 9))
-        self.log_edit.setMinimumHeight(110)
-        self.log_edit.setMaximumHeight(150)
-        layout.addWidget(self.log_edit)
-        return card
-
-    def _build_footer(self) -> QWidget:
-        card = QFrame()
-        card.setObjectName("card")
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(16, 12, 16, 12)
-        top = QHBoxLayout()
-        self.status_label = QLabel("准备就绪")
-        self.status_label.setObjectName("muted")
-        self.counter_label = QLabel("")
-        self.counter_label.setObjectName("muted")
-        top.addWidget(self.status_label)
-        top.addStretch()
-        top.addWidget(self.counter_label)
-        layout.addLayout(top)
         self.progress = QProgressBar()
+        self.progress.setObjectName("edge")
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
         self.progress.setTextVisible(False)
+        self.progress.setFixedHeight(3)
         layout.addWidget(self.progress)
-        buttons = QHBoxLayout()
-        buttons.addStretch()
+
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        self.status_label = QLabel("准备就绪")
+        self.status_label.setObjectName("status")
+        self.counter_label = QLabel("")
+        self.counter_label.setObjectName("meterValue")
         self.stop_button = QPushButton("停止")
         self.stop_button.setObjectName("danger")
         self.stop_button.setEnabled(False)
@@ -424,32 +360,21 @@ class TranslateWindow(QMainWindow):
         self.start_button = QPushButton("开始翻译")
         self.start_button.setObjectName("primary")
         self.start_button.clicked.connect(self._start)
-        buttons.addWidget(self.stop_button)
-        buttons.addWidget(self.start_button)
-        layout.addLayout(buttons)
+        row.addWidget(self.status_label)
+        row.addStretch()
+        row.addWidget(self.counter_label)
+        row.addWidget(self.stop_button)
+        row.addWidget(self.start_button)
+        layout.addLayout(row)
         self._settings_widgets = [
             self.backend_combo, self.source_combo, self.target_combo,
             self.swap_check, self.add_button, self.remove_button, self.clear_button,
         ]
-        return card
+        return bar
 
     # ------------------------------------------------------------------
     # Drag & drop / file list
     # ------------------------------------------------------------------
-
-    def _drag_enter_event(self, event: QDragEnterEvent) -> None:
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-        else:
-            event.ignore()
-
-    def _drop_event(self, event: QDropEvent) -> None:
-        paths = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
-        if paths:
-            self._add_paths(paths)
-            event.acceptProposedAction()
-        else:
-            event.ignore()
 
     def _choose_files(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(
@@ -457,7 +382,24 @@ class TranslateWindow(QMainWindow):
         )
         self._add_paths(files)
 
+    def _refresh_queue_view(self) -> None:
+        self.queue_stack.setCurrentIndex(1 if self.paths else 0)
+        self.queue_hint.setText(f"{len(self.paths)} 个字幕文件" if self.paths else "尚未添加文件")
+        self.remove_button.setEnabled(not self._is_running and bool(self.paths))
+        self.clear_button.setEnabled(not self._is_running and bool(self.paths))
+        self.start_button.setEnabled(not self._is_running and bool(self.paths))
+
+    def _style_status_item(self, item: QTableWidgetItem) -> None:
+        background, foreground = status_colors(item.text())
+        item.setBackground(QColor(background))
+        item.setForeground(QColor(foreground))
+
     def _add_paths(self, raw_paths: list[str]) -> None:
+        # The worker iterates a snapshot of self.paths, so files dropped in
+        # mid-run would sit in the table as "等待翻译" forever.
+        if self._is_running:
+            self._set_status("警告: 任务运行中，先停止后再添加文件。")
+            return
         for raw_path in raw_paths:
             path = Path(raw_path).expanduser().resolve()
             if not path.is_file() or path.suffix.lower() != ".srt":
@@ -471,11 +413,17 @@ class TranslateWindow(QMainWindow):
             name_item.setToolTip(str(path))
             name_item.setData(Qt.ItemDataRole.UserRole, str(path))
             self.file_table.setItem(row, 0, name_item)
-            self.file_table.setItem(row, 1, QTableWidgetItem("等待翻译"))
+            status_item = QTableWidgetItem("等待翻译")
+            status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._style_status_item(status_item)
+            self.file_table.setItem(row, 1, status_item)
             self._row_by_path[str(path)] = row
-            self._append_log(f"已添加: {path.name}")
+        self._refresh_queue_view()
 
     def _remove_selected(self) -> None:
+        if self._is_running:
+            self._set_status("警告: 任务运行中，先停止后再移除文件。")
+            return
         rows = sorted(
             {index.row() for index in self.file_table.selectionModel().selectedRows()},
             reverse=True,
@@ -485,11 +433,24 @@ class TranslateWindow(QMainWindow):
             self.paths.remove(path)
             self._row_by_path.pop(str(path), None)
             self.file_table.removeRow(row)
+        self._rebuild_row_index()
+        self._refresh_queue_view()
+
+    def _rebuild_row_index(self) -> None:
+        """Row numbers shift after a removal; re-derive them from the table."""
+        self._row_by_path.clear()
+        for row in range(self.file_table.rowCount()):
+            key = self.file_table.item(row, 0).data(Qt.ItemDataRole.UserRole)
+            self._row_by_path[key] = row
 
     def _clear_files(self) -> None:
+        if self._is_running:
+            self._set_status("警告: 任务运行中，先停止后再清空列表。")
+            return
         self.paths.clear()
         self._row_by_path.clear()
         self.file_table.setRowCount(0)
+        self._refresh_queue_view()
 
     # ------------------------------------------------------------------
     # Run control
@@ -498,7 +459,15 @@ class TranslateWindow(QMainWindow):
     def _on_backend_changed(self, label: str) -> None:
         backend = BACKEND_MAP.get(label, "bing")
         if backend == "bing" and SOURCE_LANGUAGE_MAP[self.source_combo.currentText()] == "auto":
-            self._append_log("提示: Edge 后端不支持自动检测源语言，请选择实际源语言。")
+            self._set_status("Edge 后端不支持自动检测源语言，请选择实际源语言。")
+
+    def _set_status(self, message: str) -> None:
+        """The status line is the only channel: no separate log pane.
+
+        Per-file progress already lives in the 状态 column, so a second log
+        box would repeat it in prose.
+        """
+        self.status_label.setText(message)
 
     def _start(self) -> None:
         if not self.paths:
@@ -567,15 +536,20 @@ class TranslateWindow(QMainWindow):
         self.start_button.setVisible(not running)
         for widget in self._settings_widgets:
             widget.setEnabled(not running)
+        self._refresh_queue_view()
 
     def _update_progress(self, completed: int, total: int) -> None:
         self.progress.setValue(int(completed / max(total, 1) * 100))
         self.counter_label.setText(f"{completed}/{total}")
+        current = self.paths[completed - 1].name if 0 < completed <= len(self.paths) else ""
+        self.status_label.setText(f"翻译中 · {current}" if current else "翻译中…")
 
     def _update_file_status(self, raw_path: str, status: str) -> None:
         row = self._row_by_path.get(raw_path)
         if row is not None and row < self.file_table.rowCount():
-            self.file_table.item(row, 1).setText(status)
+            item = self.file_table.item(row, 1)
+            item.setText(status)
+            self._style_status_item(item)
 
     def _worker_finished(self, done: int, failed: int, cancelled: bool) -> None:
         self._set_running(False)
@@ -587,21 +561,29 @@ class TranslateWindow(QMainWindow):
             summary = f"完成 · 成功 {done}"
         self.status_label.setText(summary)
         self.counter_label.setText("")
-        self._append_log(summary)
 
     def _thread_finished(self) -> None:
         self._thread = None
         self._worker = None
 
     def _append_log(self, message: str) -> None:
-        self.log_edit.append(html.escape(message))
-        self.log_edit.ensureCursorVisible()
+        """Worker log lines collapse into the status line."""
+        self.status_label.setText(message)
 
     def closeEvent(self, event) -> None:
+        # The translation worker finishes the batch in flight before emitting
+        # finished, so waiting here would freeze the UI for the whole run.
+        # Ask the user to retry instead — the window closes normally once the
+        # worker signals completion and clears self._thread.
         if self._thread and self._thread.isRunning():
             self._cancel.set()
-            self._thread.quit()
-            self._thread.wait(5000)
+            QMessageBox.information(
+                self,
+                "正在停止",
+                "当前任务正在停止，请等待进度条走完后关闭窗口。",
+            )
+            event.ignore()
+            return
         event.accept()
 
 

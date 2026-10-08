@@ -113,6 +113,10 @@ The Microsoft Edge Translator endpoint needs no API key; it sends a batch of 50 
 
 The legacy GTX endpoint uses `translate.googleapis.com/translate_a/t`, merging each batch into a single request separated by newlines. It requires a proxy; selecting "Legacy GTX (free)" in the GUI prompts for one, e.g. `127.0.0.1:7897`.
 
+The **Index-Translate official API** (`index_api`) serves the stronger `Index-Translate-35B-A3B` model for free with any API key. Subtitle text is sent to `index-translate.bilibili.com`, and the endpoint needs a proxy to be reachable.
+
+The **local model** (`llm`) translates entirely offline using GGUF weights. Point the "Local model" field at your own quantized build (a directory or a `.gguf` file both work); leaving it empty uses the default weights in `models/index-translate-9b/`. See `models/README.md` for measured quantization trade-offs.
+
 ### Command line — transcribe and translate
 
 ```bash
@@ -155,8 +159,8 @@ translate_srt('demo.srt', 'zh', provider=EdgeTranslator())
 | `--no-vad` | flag | false | Disable VAD voice detection |
 | `--no-cleanup` | flag | false | Keep temporary audio files |
 | `--translate` | str | — | Translation target language (e.g. zh / en / ko); omit to skip translation |
-| `--translator` | str | `bing` | Backend: `bing` / `gtx` |
-| `--proxy` | URL | — | Proxy for legacy GTX, e.g. `127.0.0.1:7897` |
+| `--translator` | str | `bing` | Backend: `bing` / `gtx` / `index_api` / `llm` |
+| `--proxy` | URL | — | Proxy for GTX / index_api, e.g. `127.0.0.1:7897` |
 | `--verbose` | flag | false | Enable DEBUG level logging |
 | `--force` | flag | false | Ignore the resume checkpoint and redo everything |
 

@@ -85,6 +85,32 @@ class TranslateConfig:
     request_delay: float = 3.0   # seconds between batch submissions (Bing rate-limit)
     token_ttl: int = 480         # seconds before token refresh
 
+    @classmethod
+    def for_local_llm(cls, **overrides) -> "TranslateConfig":
+        """Config tuned for the in-process GGUF model.
+
+        The defaults above exist to keep Bing/Edge inside their rate limits
+        and do not apply to a local llama.cpp context:
+
+        - ``batch_size=20``: measured on Index-Translate-9B, packed prompts
+          stay reliably parseable up to ~20 numbered lines. At 25-40 lines
+          the model stops early and drops trailing numbers, and the
+          translator then re-runs the whole group one line at a time —
+          far slower than smaller batches.
+        - ``request_delay=0``: no rate limit to respect locally; the default
+          3 s added ~48 s of pure sleeping over a 17-batch file.
+        - ``max_workers=1``: a single llama.cpp context is not thread-safe
+          and completions are serialized by a lock, so extra workers only
+          add contention.
+        """
+        params: dict = {
+            "batch_size": 20,
+            "max_workers": 1,
+            "request_delay": 0.0,
+        }
+        params.update(overrides)
+        return cls(**params)
+
     def __post_init__(self) -> None:
         if self.batch_size < 1:
             raise ValueError("batch_size must be >= 1")

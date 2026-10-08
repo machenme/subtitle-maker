@@ -39,8 +39,12 @@ video_extensions:
 output_formats:                   # Formats to generate
   - srt
 translate_to: "zh"                  # Auto-translate SRT to language ("" = skip)
-translation_provider: "bing"        # bing | gtx | llm（llm = 本地 Hy-MT2 GGUF 模型，离线翻译）
-translation_proxy: ""               # Required by gtx, e.g. http://127.0.0.1:7897
+translation_provider: "bing"        # bing | gtx | index_api | llm
+                                    #   index_api = Index-Translate 官方免费 API（35B-A3B，需联网·更快更强）
+                                    #   llm      = 本地 GGUF 模型（离线，不上传字幕）
+translation_proxy: ""               # gtx / index_api 必填，如 http://127.0.0.1:7897
+translation_model_path: ""          # 仅 llm 使用：.gguf 文件或其所在目录；留空 = 内置默认
+                                    # 例：models/index-translate-9b 或 D:\models\my-model.Q4_K_M.gguf
 swap_subtitles: true               # Rename translated → .srt, original → .{lang}.srt
 
 # --- Cleanup ---
