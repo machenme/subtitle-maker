@@ -1,8 +1,12 @@
-# Built desktop launcher
-# NOTE: Subtitle-Maker.exe is tracked on purpose so a fresh clone can run the GUI
-# without building. Rebuild it with launcher\build_exe.bat after changing the
-# launcher sources — the binary must be re-committed by hand.
+# PyInstaller build artefacts.
+# The launcher is NOT tracked: it is an ~8 MB rebuildable binary, and a fresh
+# clone can run the GUI directly with `uv run python -m src.gui`. Build it
+# yourself with launcher\build_exe.bat only if you want the double-click
+# shortcut — the script copies the result next to the sources for you.
 *.spec
+# Anchored to the repo root: build_exe.bat copies the built binary here, and
+# an unanchored rule would also hide legitimate .exe files elsewhere.
+/Subtitle-Maker.exe
 
 # Python
 __pycache__/

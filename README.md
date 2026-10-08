@@ -9,7 +9,7 @@ Input covers common video containers plus `m4a`, `mp3`, `wav`, `flac`, `ogg`, `o
 ## Features
 
 - **PySide6 desktop UI** — drag in audio/video/SRT, pick a target language, watch the live log and GPU monitor, no command line needed
-- **Console-less launcher** — double-click `Subtitle-Maker.exe` and the UI opens without any terminal window flashing up
+- **Optional double-click launcher** — pack a console-free `Subtitle-Maker.exe` yourself if you'd rather not open a terminal
 - **The queue is a drop target** — the drop zone hides itself once you have files; drag audio/video, SRT files or a whole folder onto any part of the queue table to enqueue them
 - **Language auto-detection** — detects the spoken language by default, or pin any of 14 languages manually
 - **Multi-stream GPU parallelism** — spawns independent processes, each holding a resident `WhisperModel`, probing the safe concurrency at startup
@@ -80,16 +80,15 @@ See [models/README.md](models/README.md) for other model sizes and exact directo
 
 ## Quick start
 
-### Desktop launcher (no terminal)
+### Desktop launcher (optional)
 
-A prebuilt `Subtitle-Maker.exe` can be dropped in the project root: double-click it and the GUI opens with **no console window**. Build it yourself (after changing `launcher/` sources) with:
+`Subtitle-Maker.exe` is **not shipped in this repository** — it is a rebuildable build artefact and is not tracked. Pack it yourself if you want the double-click shortcut (requires `uv sync --group dev` for PyInstaller):
 
 ```bash
-# Requires PyInstaller: uv sync --group dev
 launcher\build_exe.bat
 ```
 
-The launcher (~8 MB) only starts the GUI; the application still runs from the source tree, so upgrading dependencies does **not** require repackaging. Startup failures pop up an error box and everything is appended to `logs\gui.log`.
+The script writes an ~8 MB `Subtitle-Maker.exe` into the project root; double-click it and the GUI opens with **no console window**. It only starts the GUI — the application still runs from the source tree, so upgrading dependencies does **not** require repackaging. Startup failures pop up an error box and everything is appended to `logs\gui.log`.
 
 ### GUI (recommended)
 
@@ -351,11 +350,10 @@ subtitle-maker/
 │   └── utils.py              # File scanning, SRT validation, timestamp formatting
 ├── models/                   # Models (download yourself, see models/README.md)
 │   └── faster-whisper-large-v3-turbo-ct2/
-├── launcher/                 # Console-less desktop launcher (sources + build script)
+├── launcher/                 # Optional console-less launcher (sources + build script; artefact not tracked)
 ├── output/                   # Output directory (defaults to the video's own folder)
 │   ├── {video_name}.srt
 │   └── ...
-├── Subtitle-Maker.exe        # Double-click desktop launcher
 ├── config.yaml               # Default configuration
 ├── pyproject.toml            # uv project metadata
 ├── uv.lock                   # Locked dependency versions (reproducible builds)
