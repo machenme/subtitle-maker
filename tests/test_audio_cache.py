@@ -33,7 +33,7 @@ def test_cancelled_run_respects_temp_audio_cleanup_setting(tmp_path: Path, monke
     source.touch()
     wav_path = tmp_path / "sample.wav"
 
-    def fake_extract(self, _source):
+    def fake_extract(self, _source, **_kwargs):
         wav_path.write_bytes(b"audio cache")
         return wav_path
 

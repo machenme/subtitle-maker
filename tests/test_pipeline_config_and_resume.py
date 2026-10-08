@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import pytest
@@ -129,3 +130,70 @@ def test_zero_chunk_duration_from_cli_overrides_yaml(tmp_path: Path):
 
 def test_interrupted_run_has_nonzero_exit_code():
     assert _exit_code(failed_count=0, done_count=1, interrupted=True) == 130
+
+
+def test_fingerprint_cache_returns_equal_result_without_rereading(tmp_path: Path):
+    """A repeated fingerprint call must reuse the cached value, not redo the IO."""
+    from src import task_manager as tm
+
+    media = tmp_path / "movie.mp4"
+    media.write_bytes(os.urandom(1024))
+
+    tm._FINGERPRINT_CACHE.clear()
+    calls: list[str] = []
+    real_compute = tm._compute_fingerprint
+
+    def counting_compute(path, size, mtime):
+        calls.append(path.name)
+        return real_compute(path, size, mtime)
+
+    tm._compute_fingerprint = counting_compute
+    try:
+        first = tm._file_fingerprint(media)
+        second = tm._file_fingerprint(media)
+    finally:
+        tm._compute_fingerprint = real_compute
+        tm._FINGERPRINT_CACHE.clear()
+
+    assert first == second
+    assert calls == ["movie.mp4"], "second call must be served from the memo"
+
+
+def test_fingerprint_cache_returns_a_copy(tmp_path: Path):
+    """Callers must not be able to corrupt the memo through the return value."""
+    from src import task_manager as tm
+
+    media = tmp_path / "movie.mp4"
+    media.write_bytes(os.urandom(1024))
+
+    tm._FINGERPRINT_CACHE.clear()
+    try:
+        first = tm._file_fingerprint(media)
+        first["head_tail_hash"] = "TAMPERED"
+        second = tm._file_fingerprint(media)
+    finally:
+        tm._FINGERPRINT_CACHE.clear()
+
+    assert second["head_tail_hash"] != "TAMPERED"
+
+
+def test_fingerprint_recomputes_when_file_changes(tmp_path: Path):
+    """A modified file must not be answered from the memo."""
+    from src import task_manager as tm
+
+    media = tmp_path / "movie.mp4"
+    media.write_bytes(os.urandom(2048))
+
+    tm._FINGERPRINT_CACHE.clear()
+    try:
+        before = tm._file_fingerprint(media)
+        stat = media.stat()
+        media.write_bytes(os.urandom(4096))
+        # Ensure a distinct mtime even on coarse-grained filesystems.
+        os.utime(media, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+        after = tm._file_fingerprint(media)
+    finally:
+        tm._FINGERPRINT_CACHE.clear()
+
+    assert before["head_tail_hash"] != after["head_tail_hash"]
+    assert after["size"] == 4096

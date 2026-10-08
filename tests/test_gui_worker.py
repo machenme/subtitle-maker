@@ -8,6 +8,7 @@ from PySide6.QtCore import QCoreApplication
 from src.gui import AsrWindow, PipelineWorker
 from src.task_manager import TaskManager
 from src.translator import TranslationError
+from src.ui_theme import FAILURE_LOG_HEX, SUCCESS_LOG_HEX, log_level_color
 
 
 _qt_app: QCoreApplication | None = None
@@ -109,8 +110,14 @@ def test_queue_summary_reports_asr_and_translation_stages():
 
 
 def test_log_color_treats_zero_failures_as_success():
-    assert AsrWindow._log_color("Transcription complete: 17 success, 0 failed (out of 17)") == "#9be1b0"
-    assert AsrWindow._log_color("Transcription complete: 16 success, 1 failed (out of 17)") == "#ff9b9b"
+    # The assertion is about semantics — "0 failed" must not read as a failure —
+    # so compare against the palette rather than hard-coded hex values.
+    clean = AsrWindow._log_color("Transcription complete: 17 success, 0 failed (out of 17)")
+    failed = AsrWindow._log_color("Transcription complete: 16 success, 1 failed (out of 17)")
+    assert clean == log_level_color("Transcription complete: 17 success, 0 failed (out of 17)")
+    assert clean != failed
+    assert clean == SUCCESS_LOG_HEX
+    assert failed == FAILURE_LOG_HEX
 
 
 def test_asr_continues_while_previous_subtitles_are_translating(tmp_path: Path, monkeypatch):
