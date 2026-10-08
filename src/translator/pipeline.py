@@ -32,6 +32,7 @@ def translate_srt(
     output_path: str | Path | None = None,
     monolingual_output_path: str | Path | None = None,
     original_output_path: str | Path | None = None,
+    progress_callback: callable | None = None,
 ) -> Path:
     """
     Translate an SRT file end-to-end.
@@ -54,6 +55,8 @@ def translate_srt(
             bilingual output.
         monolingual_output_path: Optional path for the translated-only SRT.
         original_output_path: Optional path for a copy of the source SRT.
+        progress_callback: Optional ``(fraction: float) -> None`` invoked as
+            batches complete, so a long subtitle file is not a silent wait.
 
     Returns:
         Path to the written bilingual SRT file.
@@ -169,6 +172,11 @@ def translate_srt(
                 results[idx] = lines
             if completed:
                 active_limit = cfg.max_workers
+                if progress_callback:
+                    try:
+                        progress_callback(len(results) / len(batches) if batches else 1.0)
+                    except Exception:
+                        logger.debug("Translation progress callback failed", exc_info=True)
     finally:
         # Finish already-started requests before reporting failure, so the GUI
         # cannot finish while worker threads continue logging/API activity.
@@ -181,6 +189,11 @@ def translate_srt(
         len(results),
         len(batches),
     )
+    if progress_callback:
+        try:
+            progress_callback(1.0)
+        except Exception:
+            logger.debug("Translation progress callback failed", exc_info=True)
 
     # --- 4. Merge ---
     for batch_idx, (_, indices) in enumerate(batches):
@@ -212,11 +225,17 @@ def translate_srt_with_outputs(
     provider: TranslationProvider,
     source_lang: str = "auto",
     swap_subtitles: bool = True,
+    config: TranslateConfig | None = None,
+    progress_callback: callable | None = None,
 ) -> tuple[Path, Path | None, Path | None]:
     """Translate an SRT using the project's standard output file layout.
 
     Returns ``(translated_or_bilingual, bilingual, original)``. The final two
     paths are ``None`` when subtitle swapping is disabled.
+
+    ``config`` lets a caller override pipeline tunables; local-LLM callers
+    should pass :meth:`TranslateConfig.for_local_llm` so batch size and rate
+    limiting match the in-process model instead of the Bing defaults.
     """
     file_path = Path(srt_path)
     if not swap_subtitles:
@@ -225,6 +244,8 @@ def translate_srt_with_outputs(
             target_lang,
             provider=provider,
             source_lang=source_lang,
+            config=config,
+            progress_callback=progress_callback,
         )
         return translated_path, None, None
 
@@ -238,8 +259,10 @@ def translate_srt_with_outputs(
         target_lang,
         provider=provider,
         source_lang=source_lang,
+        config=config,
         output_path=bilingual_path,
         monolingual_output_path=file_path,
         original_output_path=original_path,
+        progress_callback=progress_callback,
     )
     return translated_path, bilingual_path, original_path

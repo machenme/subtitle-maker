@@ -1,13 +1,18 @@
-"""Local Hy-MT2 GGUF translation backend (llama.cpp via llama-cpp-python).
+"""Local GGUF translation backend (llama.cpp via llama-cpp-python).
 
-Model: tencent/Hy-MT2-1.8B-GGUF (HunyuanMT2 1.8B translator, quantized GGUF).
+Model: IndexTeam/Index-Translate-9B (GGUF, IQ4_XS imatrix quant by shoutmon).
 
-Usage notes (from the model card):
-- The model has **no default system prompt** — send a single user message.
-- Recommended sampling: temperature=0.7, top_p=0.6, top_k=20,
-  repetition_penalty=1.05, max_tokens=4096.
+Usage notes (from the model card and the official repo):
+- Qwen3.5-based instruct model with a full chat template — send a single
+  user message (same call shape the Hy-MT2 backend already used).
+- Official recommendation: greedy decoding (temperature=0), thinking OFF,
+  ``max_tokens=1024``. Thinking MUST be disabled explicitly: the chat
+  template only skips the ``<think>`` block when ``enable_thinking=False``
+  is passed, so omitting it makes the model narrate its reasoning instead of
+  translating (see ``_CHAT_TEMPLATE_KWARGS``).
 - Prompt template: translate instruction + source text, output only the
-  translation.
+  translation (identical template worked for Hy-MT2; Index-Translate is
+  trained on the same instruction style).
 """
 from __future__ import annotations
 
@@ -25,16 +30,25 @@ from src.translator.types import TranslationError
 logger = logging.getLogger(__name__)
 
 # Directory (or file) that holds the GGUF weights.
-DEFAULT_MODEL_PATH = "./models/hy-mt2-1.8b-guff"
+DEFAULT_MODEL_PATH = "./models/index-translate-9b"
 
-# Recommended generation parameters for the 1.8B model (see model card).
+# Generation parameters, mirroring the official client
+# (``inference/llm/translate.py`` / ``call_api.py`` in bilibili/Index-Translate):
+# greedy decoding, thinking OFF, 1024-token output cap.
 RECOMMENDED_SAMPLING: dict[str, float] = {
-    "temperature": 0.7,
-    "top_p": 0.6,
-    "top_k": 20,
-    "repeat_penalty": 1.05,
-    "max_tokens": 4096,
+    "temperature": 0.0,
+    "max_tokens": 1024,
 }
+
+# Injected into the GGUF ``tokenizer.chat_template`` render. The template
+# branches on ``enable_thinking``: when it is absent it appends an opening
+# ``<think>`` tag and the model emits a chain of thought *instead of* the
+# translation, which costs an order of magnitude more output tokens (measured:
+# 104 tok for 10 subtitles vs 1379 tok for 20). The official client forces
+# this off; llama-cpp-python's ``create_chat_completion`` cannot forward extra
+# template kwargs, so :meth:`LlmTranslator._complete` renders the template
+# itself and passes ``enable_thinking=False``.
+_CHAT_TEMPLATE_KWARGS: dict[str, bool] = {"enable_thinking": False}
 
 # Full language names required by the Hy-MT2 prompt template.
 _LANGUAGE_NAMES: dict[str, str] = {
@@ -75,6 +89,24 @@ _MULTI_PROMPT_TEMPLATE = (
 _LINE_TEMPLATE = "{number}. {text}"
 # Parses "12. translated text" (tolerating CJK punctuation after the dot).
 _RESPONSE_LINE_RE = re.compile(r"^\s*(\d+)\s*[.、．)）]\s*(.*)$")
+
+
+def _strip_think(text: str) -> str:
+    """Drop any chain-of-thought block from the model's reply.
+
+    Mirrors ``strip_think()`` in the official client's ``call_api.py``: with
+    thinking disabled the template prefills an empty ``<think></think>``
+    block, but a stray ``</think>`` can still survive, and any real CoT text
+    would otherwise leak into the subtitle.
+    """
+    if "</think>" in text:
+        text = text.split("</think>", 1)[1]
+    return text.strip().removeprefix("<think>").strip()
+
+
+# Cached jinja2 environment for rendering the GGUF chat template; building the
+# sandbox per call would recompile the template for every subtitle batch.
+_chat_template_env = None
 # Cap on prompt size per completion, in tokens (measured with the model's
 # own tokenizer, not estimated). ~20000 input tokens + 4096 output tokens
 # fits a 32768 context with headroom for the instruction template.
@@ -90,7 +122,7 @@ _OUTPUT_RESERVE_TOKENS = 4352
 # GPU cannot fit the KV cache of the full context.
 _N_CTX_CANDIDATES = (32768, 16384, 8192, 4096)
 # Fallback KV-cache estimate (bytes/token, f16 K+V) when model metadata is
-# unavailable — conservative value for a 1.8B-class model.
+# unavailable — conservative value for a mid-size instruct model.
 _FALLBACK_KV_BYTES_PER_TOKEN = 32 * 1024
 # VRAM headroom kept for the CUDA context, compute buffers and activations,
 # on top of weights + KV cache. Includes ~1GB extra safety margin so small
@@ -136,11 +168,13 @@ def _parse_numbered_lines(response: str, expected: int) -> list[str] | None:
 
 
 class LlmTranslator:
-    """Translate subtitle text with a local Hy-MT2 GGUF model via llama-cpp-python.
+    """Translate subtitle text with a local GGUF model via llama-cpp-python
+    (Index-Translate-9B, previously Hy-MT2-1.8B).
 
     The model weights are loaded lazily on first use and kept resident for the
     process lifetime. Generation is serialized with a lock because a single
-    llama.cpp context is not thread-safe.
+    llama.cpp context is not thread-safe; loading uses a separate lock so
+    concurrent callers cannot each pull a multi-GB copy of the weights.
     """
 
     def __init__(
@@ -161,7 +195,16 @@ class LlmTranslator:
         self.max_batch_tokens = max_batch_tokens
         self.verbose = verbose
         self._llm = None
+        # Generation lock: a single llama.cpp context is not thread-safe, so
+        # completions are serialized.
         self._lock = threading.Lock()
+        # Separate load lock. translate_batch() groups texts (and therefore
+        # tokenizes them) before it takes self._lock, so the model can be
+        # requested from several threads at once; without this, two threads
+        # would each load a multi-GB GGUF and one copy would be discarded.
+        # Deliberately not self._lock: _ensure_model() is never called while
+        # holding it, and threading.Lock is not reentrant.
+        self._load_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # TranslationProvider interface
@@ -216,36 +259,11 @@ class LlmTranslator:
 
         with self._lock:
             for group in groups:
-                if not use_packing or len(group) == 1:
-                    for index in group:
-                        results[index] = self._complete(
-                            llm,
-                            _PROMPT_TEMPLATE.format(
-                                source_part="",
-                                target_name=target_name,
-                                text=texts[index],
-                            ),
-                        )
-                    continue
-                packed = "\n".join(
-                    _LINE_TEMPLATE.format(number=n + 1, text=texts[i])
-                    for n, i in enumerate(group)
-                )
-                translated = self._complete(
-                    llm,
-                    _MULTI_PROMPT_TEMPLATE.format(
-                        target_name=target_name, text=packed
-                    ),
-                )
-                parsed = _parse_numbered_lines(translated, len(group))
-                if parsed is not None:
-                    for n, index in enumerate(group):
-                        results[index] = parsed[n]
-                else:
-                    logger.info(
-                        "Packed translation missing/malformed line(s); retrying "
-                        "per line",
+                if use_packing:
+                    self._translate_packed_group(
+                        llm, group, texts, results, target_name
                     )
+                else:
                     for index in group:
                         results[index] = self._complete(
                             llm,
@@ -261,28 +279,136 @@ class LlmTranslator:
         )
         return results
 
+    def _translate_packed_group(
+        self,
+        llm,
+        group: list[int],
+        texts: list[str],
+        results: list[str],
+        target_name: str,
+    ) -> None:
+        """Translate one group through a single packed completion.
+
+        The model occasionally stops before echoing every number, which
+        leaves the response unparseable. Re-running the whole group line by
+        line then costs far more than the packed attempt, so split the group
+        in half and retry instead — the halves are small enough to round-trip
+        reliably, and a single line still falls back to a plain prompt.
+        """
+        if len(group) == 1:
+            index = group[0]
+            results[index] = self._complete(
+                llm,
+                _PROMPT_TEMPLATE.format(
+                    source_part="",
+                    target_name=target_name,
+                    text=texts[index],
+                ),
+            )
+            return
+
+        packed = "\n".join(
+            _LINE_TEMPLATE.format(number=n + 1, text=texts[i])
+            for n, i in enumerate(group)
+        )
+        translated = self._complete(
+            llm,
+            _MULTI_PROMPT_TEMPLATE.format(target_name=target_name, text=packed),
+        )
+        parsed = _parse_numbered_lines(translated, len(group))
+        if parsed is not None:
+            for n, index in enumerate(group):
+                results[index] = parsed[n]
+            return
+
+        middle = len(group) // 2
+        logger.info(
+            "Packed translation of %d line(s) missing/malformed; splitting "
+            "into %d + %d", len(group), middle, len(group) - middle,
+        )
+        self._translate_packed_group(
+            llm, group[:middle], texts, results, target_name
+        )
+        self._translate_packed_group(
+            llm, group[middle:], texts, results, target_name
+        )
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
 
     def _complete(self, llm, prompt: str) -> str:
-        """Run one chat completion and return the cleaned translation."""
+        """Run one chat completion and return the cleaned translation.
+
+        The chat template is rendered here instead of via
+        ``create_chat_completion`` because that entry point calls
+        ``apply_chat_template`` without forwarding extra kwargs, so
+        ``enable_thinking=False`` cannot reach the template and the model
+        would answer with a chain of thought rather than a translation.
+        """
+        rendered = self._render_chat_prompt(llm, prompt)
         try:
-            output = llm.create_chat_completion(
-                messages=[{"role": "user", "content": prompt}],
+            output = llm.create_completion(
+                rendered,
                 **RECOMMENDED_SAMPLING,
             )
         except Exception as exc:  # llama_cpp raises bare exceptions
             raise TranslationError(f"Local model inference failed: {exc}") from exc
         try:
-            content = output["choices"][0]["message"]["content"]
+            content = output["choices"][0]["text"]
         except (KeyError, IndexError, TypeError) as exc:
             raise TranslationError(
                 f"Unexpected local model output structure: {output!r}"
             ) from exc
         if not isinstance(content, str):
             raise TranslationError("Local model returned non-text content")
-        return self._clean(content)
+        return self._clean(_strip_think(content))
+
+    @staticmethod
+    def _render_chat_prompt(llm, prompt: str) -> str:
+        """Render the GGUF chat template with thinking disabled.
+
+        Falls back to the plain user message when the template cannot be
+        rendered (missing metadata, no jinja2, unknown template syntax) so a
+        template change degrades to "slower" rather than "broken".
+        """
+        template = None
+        metadata = getattr(llm, "metadata", None)
+        if isinstance(metadata, dict):
+            template = metadata.get("tokenizer.chat_template")
+        if not isinstance(template, str) or not template:
+            logger.warning(
+                "GGUF metadata has no tokenizer.chat_template; falling back to "
+                "a bare user message (thinking may not be disabled)"
+            )
+            return prompt
+
+        global _chat_template_env
+        if _chat_template_env is None:
+            try:
+                import jinja2.sandbox
+            except ImportError:
+                logger.warning(
+                    "jinja2 is unavailable; cannot inject enable_thinking=False. "
+                    "Install it with: uv pip install jinja2"
+                )
+                return prompt
+            _chat_template_env = jinja2.sandbox.ImmutableSandboxedEnvironment(
+                trim_blocks=True,
+                lstrip_blocks=True,
+            )
+        try:
+            return _chat_template_env.from_string(template).render(
+                messages=[{"role": "user", "content": prompt}],
+                add_generation_prompt=True,
+                **_CHAT_TEMPLATE_KWARGS,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to render chat template (%s); falling back to a bare "
+                "user message", exc,
+            )
+            return prompt
 
     @staticmethod
     def _clean(text: str) -> str:
@@ -293,9 +419,19 @@ class LlmTranslator:
         return cleaned
 
     def _ensure_model(self):
-        """Load the GGUF model on first use (lazy, thread-safe enough via lock)."""
+        """Load the GGUF model on first use (thread-safe via ``_load_lock``)."""
         if self._llm is not None:
             return self._llm
+        # Double-checked locking: the fast path above stays lock-free, and the
+        # re-check inside the lock keeps a second thread from loading a second
+        # copy of the weights while the first thread is still loading.
+        with self._load_lock:
+            if self._llm is not None:
+                return self._llm
+            return self._load_model_locked()
+
+    def _load_model_locked(self):
+        """Actually load the weights. Caller must hold ``_load_lock``."""
         _enable_cuda_dll_search()
         try:
             from llama_cpp import Llama
@@ -499,7 +635,7 @@ def _kv_bytes_per_token(gguf_path: Path) -> int:
 
     Reads the actual head count / head size / layer count from the model
     file when possible; otherwise falls back to a conservative default for
-    a 1.8B-class model.
+    a mid-size instruct model.
     """
     default = _FALLBACK_KV_BYTES_PER_TOKEN
     try:
@@ -550,3 +686,6 @@ def _resolve_gguf(model_path: Path) -> Path:
 
 # Backwards-friendly alias used by the GUI labels and docs.
 HyMT2Translator = LlmTranslator
+
+# Class name that matches the current model (same object).
+IndexTranslateTranslator = LlmTranslator

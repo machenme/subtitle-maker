@@ -4,18 +4,37 @@ Extracts audio streams from media files → 16kHz Mono 16-bit PCM WAV.
 """
 from __future__ import annotations
 
+import re
 import subprocess
 import logging
 import hashlib
+import threading
+import time
 from pathlib import Path
 
 from src.utils import is_file_valid
 
 logger = logging.getLogger(__name__)
 
+# ffmpeg -progress emits key=value pairs; out_time_us is the encoded position.
+_OUT_TIME_RE = re.compile(r"^out_time_us=(\d+)", re.MULTILINE)
+# Emit at most this often while streaming ffmpeg progress.
+_PROGRESS_INTERVAL = 0.2
+
 
 class AudioExtractionError(Exception):
     """Raised when ffmpeg fails to extract audio from a media file."""
+
+
+class _FFmpegResult:
+    """Minimal stand-in for ``CompletedProcess`` returned by :meth:`_run_ffmpeg`."""
+
+    __slots__ = ("returncode", "stdout", "stderr")
+
+    def __init__(self, returncode: int, stdout: str, stderr: str):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
 
 
 class AudioExtractor:
@@ -31,16 +50,106 @@ class AudioExtractor:
         self._ffmpeg = ffmpeg_bin
 
     # ------------------------------------------------------------------
+    # ffmpeg invocation
+    # ------------------------------------------------------------------
+
+    def _run_ffmpeg(
+        self,
+        cmd: list[str],
+        *,
+        timeout: int,
+        total_seconds: float = 0.0,
+        progress_callback=None,
+    ) -> _FFmpegResult:
+        """Run ffmpeg, optionally streaming 0..1 progress to a callback.
+
+        Without a callback this stays a plain ``subprocess.run``. With one,
+        ``-progress pipe:1`` is added and the stream is parsed as it arrives:
+        extraction is often the longest single step, and a frozen bar there
+        reads as a hang.
+        """
+        if progress_callback is None:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            return _FFmpegResult(
+                result.returncode,
+                getattr(result, "stdout", "") or "",
+                getattr(result, "stderr", "") or "",
+            )
+
+        proc = subprocess.Popen(
+            [*cmd[:-1], "-progress", "pipe:1", "-nostats", cmd[-1]],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        # ffmpeg's first status block can already be near the end on a short
+        # clip, so pin an explicit 0% to guarantee a visible starting point.
+        progress_callback(0.0)
+        stderr_lines: list[str] = []
+        # ffmpeg blocks on a full stderr pipe, so it must be drained while we
+        # read progress off stdout.
+        reader = threading.Thread(
+            target=lambda: stderr_lines.extend(proc.stderr.read().splitlines()),
+            daemon=True,
+        )
+        reader.start()
+
+        deadline = time.monotonic() + timeout
+        seen: list[str] = []
+        last_emit = 0.0
+        timed_out = False
+        try:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                seen.append(line)
+                if "=" not in line:
+                    continue
+                now = time.monotonic()
+                if now - last_emit < _PROGRESS_INTERVAL:
+                    continue
+                match = _OUT_TIME_RE.search("".join(seen[-40:]))
+                if match:
+                    last_emit = now
+                    encoded = int(match.group(1)) / 1_000_000
+                    progress_callback(
+                        min(1.0, encoded / total_seconds) if total_seconds > 0 else 0.0
+                    )
+                if now > deadline:
+                    timed_out = True
+                    proc.kill()
+                    break
+            proc.wait(timeout=5)
+        finally:
+            proc.stdout.close()
+            reader.join(timeout=2)
+            proc.stderr.close()
+
+        if timed_out:
+            raise subprocess.TimeoutExpired(cmd, timeout)
+        return _FFmpegResult(proc.returncode, "", "\n".join(stderr_lines))
+
+    # ------------------------------------------------------------------
     # Single file
     # ------------------------------------------------------------------
 
-    def extract(self, video_path: Path, output_dir: Path | None = None) -> Path:
+    def extract(
+        self,
+        video_path: Path,
+        output_dir: Path | None = None,
+        *,
+        progress_callback=None,
+    ) -> Path:
         """
         Extract audio from a single video file.
 
         Args:
             video_path: Source video file path.
             output_dir: Directory for the output WAV (defaults to self._temp_dir).
+            progress_callback: Optional ``(fraction: float) -> None`` invoked
+                while ffmpeg runs. The source duration is probed only when a
+                callback is supplied, so the plain path pays nothing for it.
 
         Returns:
             Path to the extracted WAV file.
@@ -65,6 +174,8 @@ class AudioExtractor:
         # Skip if already extracted and valid
         if is_file_valid(wav_path, min_bytes=1024):
             logger.info(f"Audio already extracted: {wav_path}")
+            if progress_callback:
+                progress_callback(1.0)
             return wav_path
 
         logger.info(f"Extracting audio: {video_path.name} → {wav_name}")
@@ -85,8 +196,15 @@ class AudioExtractor:
             str(wav_path),
         ]
 
+        total_seconds = self.get_video_duration(video_path) if progress_callback else 0.0
+
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            result = self._run_ffmpeg(
+                cmd,
+                timeout=600,
+                total_seconds=total_seconds,
+                progress_callback=progress_callback,
+            )
             if result.returncode != 0:
                 # ffmpeg exits non-zero on decode errors (corrupt source).
                 # If output file exists and is usable, treat as partial success.
@@ -123,6 +241,8 @@ class AudioExtractor:
         if not is_file_valid(wav_path, min_bytes=1024):
             raise AudioExtractionError(f"Output WAV is missing or too small: {wav_path}")
 
+        if progress_callback:
+            progress_callback(1.0)
         return wav_path
 
     # ------------------------------------------------------------------
@@ -217,13 +337,16 @@ class AudioExtractor:
     # Audio chunking (for parallel transcription of long videos)
     # ------------------------------------------------------------------
 
-    def split_wav(self, wav_path: Path, chunk_duration: int) -> list[tuple[float, Path]]:
+    def split_wav(
+        self, wav_path: Path, chunk_duration: int, *, progress_callback=None
+    ) -> list[tuple[float, Path]]:
         """
         Split a WAV file into fixed-duration chunks using ffmpeg segment muxer.
 
         Args:
             wav_path: Path to the full 16kHz mono WAV.
             chunk_duration: Max seconds per chunk.
+            progress_callback: Optional ``(fraction: float) -> None`` callback.
 
         Returns:
             List of (offset_seconds, chunk_wav_path) sorted by offset.
@@ -232,6 +355,8 @@ class AudioExtractor:
         duration = self.get_duration(wav_path)
         if duration <= chunk_duration:
             logger.info(f"Audio {wav_path.name} ({duration:.0f}s) within chunk limit, no split")
+            if progress_callback:
+                progress_callback(1.0)
             return [(0.0, wav_path)]
 
         chunk_dir = wav_path.parent / f"{wav_path.stem}_chunks"
@@ -248,7 +373,12 @@ class AudioExtractor:
             "-loglevel", "error",
             pattern,
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        result = self._run_ffmpeg(
+            cmd,
+            timeout=120,
+            total_seconds=duration,
+            progress_callback=progress_callback,
+        )
         if result.returncode != 0:
             raise AudioExtractionError(
                 f"ffmpeg segment failed for {wav_path.name}: {result.stderr.strip()}"
@@ -263,6 +393,8 @@ class AudioExtractor:
             logger.debug(f"  Chunk {i}: offset={offset}s, file={cf.name}")
 
         logger.info(f"Split into {len(chunks)} chunk(s)")
+        if progress_callback:
+            progress_callback(1.0)
         return chunks
 
     # ------------------------------------------------------------------

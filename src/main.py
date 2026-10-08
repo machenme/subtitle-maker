@@ -36,6 +36,27 @@ logger = logging.getLogger(__name__)
 # Reusable pipeline function (used by both CLI and GUI)
 # ---------------------------------------------------------------------------
 
+# Each pipeline stage owns a slice of one file's 0..1 progress. Reporting the
+# raw per-stage fraction made a long ASR look stalled and then jump, because
+# nothing ever crossed the stage boundaries.
+_STAGE_SPANS: dict[str, tuple[float, float]] = {
+    "extracting": (0.00, 0.12),
+    "splitting": (0.12, 0.16),
+    "loading_model": (0.16, 0.26),
+    "transcribing": (0.26, 0.96),
+    "writing": (0.96, 1.00),
+}
+
+
+def _emit_stage(progress_callback, stage: str, fraction: float) -> None:
+    """Map a stage-local 0..1 fraction onto this file's overall 0..1 span."""
+    if not progress_callback:
+        return
+    low, high = _STAGE_SPANS.get(stage, (0.0, 1.0))
+    overall = low + (high - low) * max(0.0, min(1.0, float(fraction)))
+    progress_callback(stage, overall, 1.0)
+
+
 def _cleanup_temp_audio(wav_path: Path) -> None:
     """Remove WAV and its chunk directory.  Errors are silently ignored."""
     import shutil as _shutil
@@ -77,10 +98,15 @@ def run_one_video(
 
     logger.info(f"Extracting audio: {video_path.name}")
     if progress_callback:
-        progress_callback("extracting", 0, 100)
+        _emit_stage(progress_callback, "extracting", 0.0)
 
+    extract_kwargs = {}
+    if progress_callback:
+        extract_kwargs["progress_callback"] = (
+            lambda fraction: _emit_stage(progress_callback, "extracting", fraction)
+        )
     try:
-        wav_path = extractor.extract(video_path)
+        wav_path = extractor.extract(video_path, **extract_kwargs)
     except Exception as exc:
         return (False, 0, str(exc))
 
@@ -91,8 +117,14 @@ def run_one_video(
         chunk_sec = max(30, int(dur / config.max_workers))
         logger.info(f"Auto chunk: duration={dur:.0f}s, workers={config.max_workers} → {chunk_sec}s/chunk")
     if chunk_sec > 0:
+        split_kwargs = {}
+        if progress_callback:
+            _emit_stage(progress_callback, "splitting", 0.0)
+            split_kwargs["progress_callback"] = (
+                lambda fraction: _emit_stage(progress_callback, "splitting", fraction)
+            )
         try:
-            chunks = extractor.split_wav(wav_path, chunk_sec)
+            chunks = extractor.split_wav(wav_path, chunk_sec, **split_kwargs)
         except Exception as exc:
             if config.cleanup_temp:
                 _cleanup_temp_audio(wav_path)
@@ -112,15 +144,20 @@ def run_one_video(
     scheduler = GpuScheduler(config)
     start_time = time.time()
 
-    if progress_callback:
-        progress_callback("transcribing", 0, len(scheduler_tasks))
-
     try:
         raw_results = scheduler.process(
             scheduler_tasks,
-            progress_callback=lambda received, total: (
-                progress_callback("transcribing", received, total)
-                if progress_callback else None
+            progress_callback=(
+                lambda fraction: _emit_stage(
+                    progress_callback, "transcribing", fraction
+                )
+                if progress_callback
+                else None
+            ),
+            status_callback=(
+                lambda stage: _emit_stage(progress_callback, stage, 0.0)
+                if progress_callback
+                else None
             ),
         )
     except Exception:
@@ -175,6 +212,7 @@ def run_one_video(
     video_out_dir.mkdir(parents=True, exist_ok=True)
     set_cps_language(detected_language)
     try:
+        _emit_stage(progress_callback, "writing", 0.0)
         written = formatter.write_all(
             segments,
             base_path=video_out_dir / video_path.stem,
@@ -230,6 +268,7 @@ def run_one_video(
     )
 
     if progress_callback:
+        _emit_stage(progress_callback, "writing", 1.0)
         progress_callback("done", len(segments), len(segments))
 
     return (True, len(segments), "")
@@ -347,7 +386,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--translate", default=None, metavar="LANG",
                    help="Auto-translate SRT to target language (ISO 639-1, e.g. zh)")
     p.add_argument("--translator", default=None, choices=("bing", "gtx", "llm"),
-                   help="Translation backend (default: bing; llm = local Hy-MT2 GGUF)")
+                   help="Translation backend (default: bing; llm = local Index-Translate GGUF)")
     p.add_argument("--proxy", default=None, metavar="URL",
                    help="Proxy for Legacy GTX, e.g. 127.0.0.1:7897")
     p.add_argument("--verbose", action="store_true", help="Enable DEBUG logging")

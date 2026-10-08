@@ -85,6 +85,7 @@ def _worker_process(
     task_queue: mp.Queue,
     result_queue: mp.Queue,
     startup_queue: mp.Queue,
+    progress_queue: mp.Queue,
     semaphore: mp.Semaphore,
     worker_id: int,
 ) -> None:
@@ -95,6 +96,7 @@ def _worker_process(
     - Acquires semaphore slot before processing (controls GPU concurrency).
     - Reuses the loaded model while looping on task_queue.
     - Sends (audio_path, segments) or (audio_path, error_string) to result_queue.
+    - Streams (audio_path, fraction) to progress_queue while decoding.
     """
     # Ensure nvidia CUDA DLLs are on the DLL search path BEFORE any import
     # of faster_whisper / ctranslate2. Must happen here in the child process
@@ -157,6 +159,7 @@ def _worker_process(
                     beam_size=beam_size,
                     vad_filter=vad_filter,
                     compute_type=compute_type,
+                    progress_queue=progress_queue,
                 )
                 result_queue.put((audio_path, (segments, detected_language)))
             except Exception as exc:
@@ -190,10 +193,14 @@ class GpuScheduler:
         self._task_queue: mp.Queue | None = None
         self._result_queue: mp.Queue | None = None
         self._startup_queue: mp.Queue | None = None
+        self._progress_queue: mp.Queue | None = None
         self._semaphore: mp.Semaphore | None = None
         self._workers: list[mp.Process] = []
         self._ctx = mp.get_context("spawn")
         self._abort_workers = False
+        # audio_path -> 0..1 decode progress, fed by the worker processes.
+        self._chunk_progress: dict[str, float] = {}
+        self._scheduled_tasks: list[tuple[Path, Path]] = []
 
     # ------------------------------------------------------------------
     # Public API
@@ -203,14 +210,18 @@ class GpuScheduler:
         self,
         tasks: list[tuple[Path, Path]],  # [(audio_path, video_path), ...]
         *,
-        progress_callback: callable = None,  # (received: int, total: int) -> None
+        progress_callback: callable = None,  # (fraction: float) -> None
+        status_callback: callable = None,   # (stage: str) -> None
     ) -> dict[Path, tuple[list[Segment], str]]:
         """
         Run ASR transcription on all queued audio files.
 
         Args:
             tasks: List of (audio_path, video_path) tuples to process.
-            progress_callback: Optional callback for progress updates.
+            progress_callback: Optional callback receiving a 0..1 fraction of
+                the whole batch, updated continuously while chunks decode.
+            status_callback: Optional callback receiving a coarse stage name so
+                the UI can explain a pause (model loading, for instance).
 
         Returns:
             Dict mapping audio_path → (segments, detected language).
@@ -218,15 +229,20 @@ class GpuScheduler:
         """
         if not tasks:
             logger.info("No tasks to process")
+            if progress_callback:
+                progress_callback(1.0)
             return {}
 
         self._abort_workers = False
+        self._chunk_progress = {}
         self._setup_queues()
         try:
-            self._start_workers(task_count=len(tasks))
+            self._start_workers(task_count=len(tasks), status_callback=status_callback)
             self._enqueue_tasks(tasks)
             return self._collect_results(
-                expected=len(tasks), progress_callback=progress_callback
+                expected=len(tasks),
+                progress_callback=progress_callback,
+                status_callback=status_callback,
             )
         finally:
             self._shutdown()
@@ -239,13 +255,16 @@ class GpuScheduler:
         self._task_queue = self._ctx.Queue()
         self._result_queue = self._ctx.Queue()
         self._startup_queue = self._ctx.Queue()
+        self._progress_queue = self._ctx.Queue()
         self._semaphore = self._ctx.Semaphore(self._cfg.max_workers)
 
-    def _start_workers(self, task_count: int) -> None:
+    def _start_workers(self, task_count: int, *, status_callback=None) -> None:
         # max_workers is an upper bound. Startup proceeds one worker at a time
         # until the first model load fails, leaving the previous workers alive.
         num_workers = max(1, min(self._cfg.max_workers, task_count))
         logger.info("Trying up to %d GPU worker(s) via startup probing", num_workers)
+        if status_callback:
+            status_callback("loading_model")
         previous_worker_vram_gb: float | None = None
         for i in range(num_workers):
             before_free_vram_gb = _free_vram_gb()
@@ -260,21 +279,22 @@ class GpuScheduler:
 
             p = self._ctx.Process(
                 target=_worker_process,
-                args=(
-                    str(self._cfg.model_path),
-                    self._cfg.language,
-                    self._cfg.beam_size,
-                    self._cfg.vad_filter,
-                    self._cfg.compute_type,
-                    self._task_queue,
-                    self._result_queue,
-                    self._startup_queue,
-                    self._semaphore,
-                    i,
-                ),
-                name=f"asr-worker-{i}",
-                daemon=True,
-            )
+                    args=(
+                        str(self._cfg.model_path),
+                        self._cfg.language,
+                        self._cfg.beam_size,
+                        self._cfg.vad_filter,
+                        self._cfg.compute_type,
+                        self._task_queue,
+                        self._result_queue,
+                        self._startup_queue,
+                        self._progress_queue,
+                        self._semaphore,
+                        i,
+                    ),
+                    name=f"asr-worker-{i}",
+                    daemon=True,
+                )
             try:
                 p.start()
             except Exception as exc:
@@ -351,6 +371,7 @@ class GpuScheduler:
 
     def _enqueue_tasks(self, tasks: list[tuple[Path, Path]]) -> None:
         """Push tasks + sentinel values (one per worker) into the queue."""
+        self._scheduled_tasks = list(tasks)
         for task in tasks:
             self._task_queue.put(task)
 
@@ -359,12 +380,39 @@ class GpuScheduler:
             self._task_queue.put(_SHUTDOWN)
 
     def _collect_results(
-        self, expected: int, *, progress_callback: callable = None
+        self,
+        expected: int,
+        *,
+        progress_callback: callable = None,
+        status_callback=None,
     ) -> dict[Path, tuple[list[Segment], str]]:
         """Drain result queue until expected count reached."""
         results: dict[Path, tuple[list[Segment], str]] = {}
         received = 0
         errors = 0
+        reported = -1.0
+        if status_callback:
+            status_callback("transcribing")
+        # Every task counts as one unit regardless of its length, so the
+        # fraction is the mean of the per-chunk decode progress. Counting
+        # finished chunks instead left a single-chunk video pinned at 0% for
+        # its entire run.
+        task_keys = [str(audio_path) for audio_path, _ in self._scheduled_tasks]
+
+        def report_progress() -> None:
+            nonlocal reported
+            if not progress_callback:
+                return
+            fraction = self._aggregate_progress(task_keys)
+            # Throttle to whole percent: the queue drains fast enough that
+            # every report would otherwise be a wasted repaint.
+            if fraction - reported < 0.005 and fraction < 1.0:
+                return
+            reported = fraction
+            progress_callback(fraction)
+
+        self._drain_progress_queue()
+        report_progress()
 
         while received < expected:
             free_vram_gb = _free_vram_gb()
@@ -389,8 +437,9 @@ class GpuScheduler:
                     results[audio_path] = payload
 
                 received += 1
-                if progress_callback:
-                    progress_callback(received, expected)
+                # A finished chunk counts as fully decoded even if its worker
+                # never managed to stream intermediate updates.
+                self._chunk_progress[str(audio_path)] = 1.0
             except queue.Empty:
                 # A worker killed by CUDA/OOM can leave tasks without a result.
                 # Fail immediately instead of reporting endless progress while
@@ -428,14 +477,44 @@ class GpuScheduler:
                 logger.info(
                     f"Transcribing... ({received}/{expected} done, {alive} worker(s) active)"
                 )
-                if progress_callback:
-                    progress_callback(received, expected)
 
+            # Drain outside both branches so intra-chunk updates land on the
+            # poll iterations where no result arrived.
+            self._drain_progress_queue()
+            report_progress()
+
+        report_progress()
         logger.info(
             f"Transcription complete: {len(results)} success, {errors} failed "
             f"(out of {expected})"
         )
         return results
+
+    def _drain_progress_queue(self) -> None:
+        """Absorb every pending (audio_path, fraction) report from the workers."""
+        if self._progress_queue is None:
+            return
+        while True:
+            try:
+                audio_path, fraction = self._progress_queue.get_nowait()
+            except queue.Empty:
+                return
+            except (OSError, ValueError):  # pragma: no cover - closed queue
+                return
+            try:
+                value = max(0.0, min(1.0, float(fraction)))
+            except (TypeError, ValueError):
+                continue
+            key = str(audio_path)
+            # Never let a late report walk a chunk backwards.
+            if value > self._chunk_progress.get(key, 0.0):
+                self._chunk_progress[key] = value
+
+    def _aggregate_progress(self, task_keys: list[str]) -> float:
+        if not task_keys:
+            return 1.0
+        total = sum(self._chunk_progress.get(key, 0.0) for key in task_keys)
+        return min(1.0, total / len(task_keys))
 
     def _shutdown(self) -> None:
         """Join all worker processes."""
