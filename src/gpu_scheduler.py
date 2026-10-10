@@ -201,6 +201,10 @@ class GpuScheduler:
         # audio_path -> 0..1 decode progress, fed by the worker processes.
         self._chunk_progress: dict[str, float] = {}
         self._scheduled_tasks: list[tuple[Path, Path]] = []
+        # audio_path -> error for tasks that never produced a result. Kept so a
+        # dead worker yields one failure per untouched file instead of a single
+        # opaque batch error (see _mark_unfinished_failed).
+        self._task_errors: dict[Path, str] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -212,6 +216,7 @@ class GpuScheduler:
         *,
         progress_callback: callable = None,  # (fraction: float) -> None
         status_callback: callable = None,   # (stage: str) -> None
+        error_sink: dict[Path, str] | None = None,
     ) -> dict[Path, tuple[list[Segment], str]]:
         """
         Run ASR transcription on all queued audio files.
@@ -222,10 +227,14 @@ class GpuScheduler:
                 the whole batch, updated continuously while chunks decode.
             status_callback: Optional callback receiving a coarse stage name so
                 the UI can explain a pause (model loading, for instance).
+            error_sink: Optional dict filled with ``audio_path -> reason`` for
+                every task that produced no result. Without it the caller can
+                only see that a key is missing, not why.
 
         Returns:
             Dict mapping audio_path → (segments, detected language).
-            Failed tasks are excluded from the dict (errors are logged).
+            Failed tasks are excluded from the dict (errors are logged, and
+            reported through *error_sink* when supplied).
         """
         if not tasks:
             logger.info("No tasks to process")
@@ -235,15 +244,19 @@ class GpuScheduler:
 
         self._abort_workers = False
         self._chunk_progress = {}
+        self._task_errors = {}
         self._setup_queues()
         try:
             self._start_workers(task_count=len(tasks), status_callback=status_callback)
             self._enqueue_tasks(tasks)
-            return self._collect_results(
+            results = self._collect_results(
                 expected=len(tasks),
                 progress_callback=progress_callback,
                 status_callback=status_callback,
             )
+            if error_sink is not None:
+                error_sink.update(self._task_errors)
+            return results
         finally:
             self._shutdown()
 
@@ -398,6 +411,7 @@ class GpuScheduler:
         # finished chunks instead left a single-chunk video pinned at 0% for
         # its entire run.
         task_keys = [str(audio_path) for audio_path, _ in self._scheduled_tasks]
+        finished: set[str] = set()
 
         def report_progress() -> None:
             nonlocal reported
@@ -433,17 +447,22 @@ class GpuScheduler:
                     # Error string
                     logger.error(f"FAILED: {audio_path.name} — {payload}")
                     errors += 1
+                    # Recorded alongside the "no result at all" cases so
+                    # error_sink reports every failure the same way.
+                    self._task_errors[audio_path] = payload
                 else:
                     results[audio_path] = payload
 
                 received += 1
+                finished.add(str(audio_path))
                 # A finished chunk counts as fully decoded even if its worker
                 # never managed to stream intermediate updates.
                 self._chunk_progress[str(audio_path)] = 1.0
             except queue.Empty:
                 # A worker killed by CUDA/OOM can leave tasks without a result.
-                # Fail immediately instead of reporting endless progress while
-                # another process remains alive but cannot make progress.
+                # Stop waiting, but report each untouched file instead of one
+                # batch-wide error: the caller marks only those files failed
+                # and the rest of the queue stays usable.
                 abnormal = [
                     w for w in self._workers
                     if not w.is_alive() and w.exitcode not in (None, 0)
@@ -451,10 +470,17 @@ class GpuScheduler:
                 if abnormal:
                     names = ", ".join(w.name for w in abnormal)
                     self._abort_workers = True
-                    raise RuntimeError(
+                    self._drain_progress_queue()
+                    self._mark_unfinished_failed(
+                        task_keys, finished,
                         f"GPU worker exited unexpectedly ({names}); "
-                        "transcription was stopped to protect system resources"
+                        "transcription was stopped to protect system resources",
                     )
+                    logger.error(
+                        "GPU worker exited unexpectedly (%s); %d task(s) left "
+                        "without a result", names, len(self._task_errors),
+                    )
+                    return results
 
                 free_vram_gb = _free_vram_gb()
                 if (
@@ -470,10 +496,17 @@ class GpuScheduler:
                 alive = sum(1 for w in self._workers if w.is_alive())
                 if alive == 0:
                     self._abort_workers = True
-                    raise RuntimeError(
+                    self._mark_unfinished_failed(
+                        task_keys, finished,
                         "All GPU workers exited before transcription completed "
-                        f"({received}/{expected} results received)"
+                        f"({received}/{expected} results received)",
                     )
+                    logger.error(
+                        "All GPU workers exited before transcription completed "
+                        "(%d/%d results received); %d task(s) left without a result",
+                        received, expected, len(self._task_errors),
+                    )
+                    return results
                 logger.info(
                     f"Transcribing... ({received}/{expected} done, {alive} worker(s) active)"
                 )
@@ -489,6 +522,27 @@ class GpuScheduler:
             f"(out of {expected})"
         )
         return results
+
+    def _mark_unfinished_failed(
+        self,
+        task_keys: list[str],
+        finished: set[str],
+        reason: str,
+    ) -> None:
+        """Record an explicit failure for every task that returned no result.
+
+        Without this the parent only knows "the batch broke", and neither the
+        GUI nor the CLI can tell which files were actually transcribed.
+        """
+        by_key = {str(audio_path): audio_path for audio_path, _ in self._scheduled_tasks}
+        for key in task_keys:
+            if key in finished:
+                continue
+            audio_path = by_key.get(key)
+            if audio_path is None or audio_path in self._task_errors:
+                continue
+            self._task_errors[audio_path] = reason
+            logger.error(f"FAILED: {Path(key).name} — {reason}")
 
     def _drain_progress_queue(self) -> None:
         """Absorb every pending (audio_path, fraction) report from the workers."""

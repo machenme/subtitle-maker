@@ -25,13 +25,24 @@ from pathlib import Path
 if __name__ == "__main__" and str(Path(__file__).resolve().parent.parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from PySide6.QtCore import QByteArray, QSettings, QThread, QTimer, Qt, QObject, QUrl, Signal
+from PySide6.QtCore import (
+    QByteArray,
+    QEvent,
+    QObject,
+    QSettings,
+    QThread,
+    QTimer,
+    Qt,
+    QUrl,
+    Signal,
+)
 from PySide6.QtGui import (
     QColor,
     QDesktopServices,
     QDragEnterEvent,
     QDropEvent,
     QFont,
+    QFontMetrics,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -92,7 +103,10 @@ from src.ui_theme import (
     section_label,
     status_colors,
 )
-from src.utils import is_srt_valid
+from src.utils import find_executable, is_srt_valid
+
+
+logger = logging.getLogger(__name__)
 
 
 LANGUAGE_MAP = {
@@ -150,6 +164,18 @@ COL_FILE = 0
 COL_PROGRESS = 1
 COL_DURATION = 2
 COL_STATUS = 3
+# Longest strings the 状态 column has to show. The column is sized from the
+# font against these instead of a hard-coded pixel count, which clipped
+# "完成 · 已翻译" at 92 px and made every finished row read "完成 · 已…".
+STATUS_SAMPLES = (
+    "完成 · 已翻译",
+    "完成 · 1234 段",
+    "等待翻译",
+    "已有字幕",
+    "翻译失败",
+)
+# Padding for Qt's own cell margins inside a table cell.
+STATUS_CELL_PADDING = 26
 # Height budget for the log strip when collapsed / expanded.
 LOG_VIEW_COLLAPSED = 62
 LOG_VIEW_EXPANDED = 260
@@ -165,6 +191,14 @@ LOG_COLLAPSED_LINES = 3
 def _collapsed_log_height() -> int:
     """Height for the collapsed strip: a peek at the tail, not a fixed box."""
     return LOG_LINE_HEIGHT * LOG_COLLAPSED_LINES
+
+
+def status_column_width(font: QFont) -> int:
+    """Pixel width that fits every status label at the current font and DPI."""
+    metrics = QFontMetrics(font)
+    widest = max(metrics.horizontalAdvance(text) for text in STATUS_SAMPLES)
+    return widest + STATUS_CELL_PADDING
+
 # Window geometry persistence.
 SETTINGS_ORG = "Subtitle Maker"
 SETTINGS_APP = "Subtitle Maker"
@@ -282,9 +316,10 @@ class DurationProbe(QObject):
 
     done = Signal(str, str)  # (path, formatted duration or "?")
 
-    def __init__(self, paths: list[Path], *, parent=None) -> None:
+    def __init__(self, paths: list[Path], *, parent=None, ffprobe_bin: str | None = None) -> None:
         super().__init__(parent)
         self._paths = paths
+        self._ffprobe_bin = ffprobe_bin
         self._done = threading.Event()
         self._thread = threading.Thread(target=self._run, name="duration-probe", daemon=True)
 
@@ -295,11 +330,11 @@ class DurationProbe(QObject):
         """Block until probing finishes. Used on window close only."""
         return self._done.wait(timeout)
 
-    @staticmethod
-    def _format_duration(path: Path) -> str:
+    def _format_duration(self, path: Path) -> str:
         try:
             result = subprocess.run(
-                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                [find_executable("ffprobe", self._ffprobe_bin), "-v", "error",
+                 "-show_entries", "format=duration",
                  "-of", "csv=p=0", str(path)],
                 capture_output=True,
                 text=True,
@@ -309,8 +344,8 @@ class DurationProbe(QObject):
             hours, minutes = divmod(int(seconds), 3600)
             minutes, seconds = divmod(minutes, 60)
             return f"{hours}h{minutes:02d}m" if hours else f"{minutes}m{seconds:02d}s"
-        except FileNotFoundError:
-            logger.error("ffprobe not found on PATH; media durations unavailable")
+        except FileNotFoundError as exc:
+            logger.error(f"ffprobe unavailable: {exc}")
             return "?"
         except Exception:
             return "?"
@@ -932,7 +967,9 @@ class AsrWindow(QMainWindow):
         header_view.setSectionResizeMode(COL_STATUS, QHeaderView.ResizeMode.Fixed)
         self.file_table.setColumnWidth(COL_PROGRESS, 84)
         self.file_table.setColumnWidth(COL_DURATION, 76)
-        self.file_table.setColumnWidth(COL_STATUS, 92)
+        # 状态 is the widest fixed column: a clipped status ("完成 · 已…") is a
+        # dead end for the user, while a clipped file name still has a tooltip.
+        self._sync_status_column_width()
         self.file_table.files_dropped.connect(self._add_paths_from_strings)
         self.file_table.doubleClicked.connect(self._open_selected_file)
 
@@ -1683,6 +1720,25 @@ class AsrWindow(QMainWindow):
         background, foreground = status_colors(item.text())
         item.setBackground(QColor(background))
         item.setForeground(QColor(foreground))
+        # Narrow windows can still elide the text; the tooltip keeps the full
+        # reason reachable instead of hiding it.
+        item.setToolTip(item.text())
+
+    def _sync_status_column_width(self) -> None:
+        """Size 状态 from the current font metrics, not a frozen pixel count."""
+        self.file_table.setColumnWidth(
+            COL_STATUS, status_column_width(self.file_table.font())
+        )
+
+    def changeEvent(self, event: QEvent) -> None:  # noqa: N802 (Qt naming)
+        # Moving the window to a monitor with a different scale factor, or a
+        # system font change, invalidates the measurement taken at build time.
+        if event.type() in (
+            QEvent.Type.FontChange,
+            QEvent.Type.ApplicationFontChange,
+        ):
+            self._sync_status_column_width()
+        super().changeEvent(event)
 
     def _probe_durations(self, paths: list[Path]) -> None:
         """Fill in media durations without blocking the UI thread."""
@@ -1690,7 +1746,8 @@ class AsrWindow(QMainWindow):
         if not pending:
             return
 
-        probe = DurationProbe(pending, parent=self)
+        ffprobe_bin = getattr(getattr(self, "config", None), "ffprobe_path", "") or None
+        probe = DurationProbe(pending, parent=self, ffprobe_bin=ffprobe_bin)
         self._duration_probes.add(probe)
 
         def on_done(raw_path: str, text: str) -> None:
@@ -1788,6 +1845,35 @@ class AsrWindow(QMainWindow):
             return path
         return output_dir / f"{path.stem}.srt"
 
+    def _translated_without_asr(self, translate_to: str) -> list[str]:
+        """Names that will be translated from an SRT instead of from audio.
+
+        These never reach Whisper, so no detected language is available and a
+        backend that refuses "auto" would only fail once the run is underway.
+        """
+        if not translate_to:
+            return []
+        output_text = self.output_edit.text().strip()
+        output_dir = Path(output_text) if output_text else (
+            self.paths[0].parent if self.paths else Path(".")
+        )
+        source_language = LANGUAGE_MAP[self.language_combo.currentText()]
+        affected: list[str] = []
+        for path in self.paths:
+            if path.suffix.lower() == ".srt":
+                affected.append(path.name)
+                continue
+            status = PipelineWorker.check_existing_subs(
+                path,
+                translate_to,
+                self.swap_check.isChecked(),
+                source_language,
+                output_dir,
+            )
+            if status in ("translate", "translate_output"):
+                affected.append(path.name)
+        return affected
+
     def _start(self) -> None:
         if not self.paths:
             QMessageBox.warning(self, "没有输入文件", "请先添加音视频或 SRT 文件。")
@@ -1806,18 +1892,21 @@ class AsrWindow(QMainWindow):
         translation_provider = TRANSLATOR_MAP[self.translator_combo.currentText()]
         translation_proxy = self.proxy_edit.text().strip()
         source_language = LANGUAGE_MAP[self.language_combo.currentText()]
-        if (
-            translate_to
-            and translation_provider == "bing"
-            and source_language == "auto"
-            and any(path.suffix.lower() == ".srt" for path in self.paths)
-        ):
-            QMessageBox.warning(
-                self,
-                "直接翻译 SRT 需要源语言",
-                "视频转写时可由 Whisper 自动识别；直接翻译 SRT 时，请在“识别语言”中选择实际源语言。",
-            )
-            return
+        if translate_to and translation_provider == "bing" and source_language == "auto":
+            # Edge rejects "auto" as a source language. ASR supplies the real
+            # one, but a file that skips ASR has nothing to fall back on.
+            no_asr = self._translated_without_asr(translate_to)
+            if no_asr:
+                preview = "、".join(no_asr[:5])
+                if len(no_asr) > 5:
+                    preview += f" 等 {len(no_asr)} 个文件"
+                QMessageBox.warning(
+                    self,
+                    "直接翻译 SRT 需要源语言",
+                    f"Microsoft Edge Translator 不支持自动识别源语言，以下文件不会经过语音识别：{preview}。\n"
+                    "请在“识别语言”中选择实际源语言。",
+                )
+                return
         if translate_to and translation_provider in ("gtx", "index_api") and not translation_proxy:
             QMessageBox.warning(
                 self,

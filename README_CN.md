@@ -46,6 +46,15 @@ scoop install ffmpeg
 ffmpeg -version
 ```
 
+程序按 **PATH → 系统持久 PATH → winget / scoop / chocolatey 常见安装目录** 的顺序自动定位
+ffmpeg 与 ffprobe，因此在安装完 ffmpeg 之后启动、或 PATH 尚未广播生效时也能正常工作。
+若仍提示找不到，可在 `config.yaml` 里显式指定（填 `.exe` 路径或其所在目录均可）：
+
+```yaml
+ffmpeg_path: "C:/Users/<你>/AppData/Local/Microsoft/WinGet/Links/ffmpeg.exe"
+ffprobe_path: ""
+```
+
 ### 2. Python 环境
 
 使用 `mise` → `uv` → Python 3.11 工具链：

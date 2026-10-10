@@ -14,6 +14,12 @@ beam_size: 5                      # Beam search width (1-10)
 vad_filter: true                  # Voice activity detection
 compute_type: "float16"           # Inference precision: float16 | int8_float16
 
+# --- External tools ---
+# ffmpeg / ffprobe 留空 = 自动探测：PATH → 系统持久 PATH → winget/scoop/choco 常见安装位置。
+# 只有当自动探测找不到时才需要填写（.exe 完整路径，或其所在目录）。
+ffmpeg_path: ""
+ffprobe_path: ""
+
 # --- Concurrency ---
 max_workers: null                  # Startup probe upper bound (null = 16; falls back on model-load failure)
 chunk_duration: 0                  # 0 = auto (split evenly by worker count), >0 = manual seconds

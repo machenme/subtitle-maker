@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from PySide6.QtWidgets import QApplication, QScrollArea, QTableWidgetItem
 from PySide6.QtCore import Qt
 
-from src.gui import AsrWindow, COL_FILE, COL_STATUS
+from src.gui import APP_STYLE, AsrWindow, COL_FILE, COL_STATUS
 
 
 def fake_rows(window, count: int) -> None:
@@ -30,6 +30,9 @@ def fake_rows(window, count: int) -> None:
 
 def main() -> int:
     app = QApplication([])
+    # Applied before the window exists, like main(); the column widths below
+    # are only meaningful with the real stylesheet font in place.
+    app.setStyleSheet(APP_STYLE)
     window = AsrWindow()
     window.resize(1180, 860)
     window.show()

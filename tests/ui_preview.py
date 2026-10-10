@@ -44,11 +44,11 @@ def main() -> int:
     shoot(window, app, "asr-empty")
 
     samples = [
-        ("lecture-01-lecture-on-distributed-systems.mp4", "34m12s", "完成"),
-        ("interview-with-engineer.wav", "1h02m05s", "处理中"),
-        ("keynote-opening.m4a", "12m48s", "翻译中"),
-        ("podcast-ep-12.mp3", "58m20s", "等待中"),
-        ("teaser-trailer.mp4", "2m31s", "已有字幕"),
+        ("489155.com@HUNTc-592.mp4", "2h19m", "完成 · 已翻译"),
+        ("489155.com@SVCAO-031.mp4", "2h19m", "完成 · 已翻译"),
+        ("489155.com@SVMGM-054.mp4", "4h52m", "处理中"),
+        ("lecture-on-distributed-systems.mp4", "34m12s", "已有字幕"),
+        ("podcast-episode-12-with-long-title.mp3", "58m20s", "等待翻译"),
     ]
     window.file_table.setRowCount(len(samples))
     for row, (name, duration, status) in enumerate(samples):

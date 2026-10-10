@@ -21,6 +21,11 @@ from src.utils import atomic_copy_file
 
 logger = logging.getLogger(__name__)
 
+# Requests already sent cannot be cancelled, so a failing run waits this long
+# for them before returning. Long enough for an in-flight HTTP call to finish,
+# short enough that one hung provider cannot stall the whole batch.
+_FAILURE_DRAIN_TIMEOUT = 30.0
+
 
 def translate_srt(
     srt_path: str | Path,
@@ -178,9 +183,23 @@ def translate_srt(
                     except Exception:
                         logger.debug("Translation progress callback failed", exc_info=True)
     finally:
-        # Finish already-started requests before reporting failure, so the GUI
-        # cannot finish while worker threads continue logging/API activity.
-        executor.shutdown(wait=True, cancel_futures=failed)
+        # Future.cancel() only stops work that has not started. Give the
+        # already-sent requests a bounded window to land, so the GUI cannot
+        # finish while workers are still using the provider — but a provider
+        # that never answers must not hold the run open indefinitely.
+        if failed and futures:
+            done, pending = wait(list(futures), timeout=_FAILURE_DRAIN_TIMEOUT)
+            if pending:
+                # The provider is still being used by these threads. Nothing
+                # here can safely stop them, so say so explicitly instead of
+                # letting a caller release the provider underneath them.
+                logger.warning(
+                    "%d translation request(s) still in flight after %.0fs; "
+                    "they will keep using the provider in the background — "
+                    "do not close or release it yet",
+                    len(pending), _FAILURE_DRAIN_TIMEOUT,
+                )
+        executor.shutdown(wait=not failed, cancel_futures=True)
 
     elapsed = time.time() - start_time
     logger.info(
@@ -249,7 +268,10 @@ def translate_srt_with_outputs(
         )
         return translated_path, None, None
 
-    source_code = source_lang if source_lang != "auto" else "ja"
+    # Without ASR there is no detected language to name the copy after.
+    # "ja" used to be hardcoded here, which mislabelled every non-Japanese
+    # source; a neutral name states what the file is instead of guessing.
+    source_code = source_lang if source_lang and source_lang != "auto" else "original"
     bilingual_path = file_path.with_stem(f"{file_path.stem}.bilingual")
     original_path = file_path.with_stem(
         f"{file_path.stem}.{iso_to_player_suffix(source_code)}"

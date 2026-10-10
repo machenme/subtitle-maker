@@ -45,6 +45,7 @@ def _make_media(path: Path, seconds: float) -> Path:
 # 1. ffmpeg extraction streams real progress
 # ---------------------------------------------------------------------------
 
+@pytest.mark.needs_ffmpeg
 def test_audio_extraction_reports_progress_bookends(tmp_path: Path):
     """The contract every caller sees: a 0% start and a 100% finish."""
     source = _make_media(tmp_path / "tone.m4a", 6)
@@ -59,6 +60,7 @@ def test_audio_extraction_reports_progress_bookends(tmp_path: Path):
     assert samples == sorted(samples), f"progress went backwards: {samples}"
 
 
+@pytest.mark.needs_ffmpeg
 def test_ffmpeg_runner_streams_intermediate_progress(tmp_path: Path):
     """The regression this fixes: extraction was one opaque blocking call.
 
@@ -96,6 +98,7 @@ def test_ffmpeg_runner_streams_intermediate_progress(tmp_path: Path):
     assert max(samples) <= 1.0
 
 
+@pytest.mark.needs_ffmpeg
 def test_audio_extraction_without_callback_still_works(tmp_path: Path):
     """The CLI path must not regress: no callback, no extra probing."""
     source = _make_media(tmp_path / "plain.m4a", 2)
@@ -103,6 +106,7 @@ def test_audio_extraction_without_callback_still_works(tmp_path: Path):
     assert wav_path.is_file() and wav_path.stat().st_size > 1024
 
 
+@pytest.mark.needs_ffmpeg
 def test_cached_audio_short_circuits_to_full(tmp_path: Path):
     source = _make_media(tmp_path / "cached.m4a", 1)
     extractor = AudioExtractor(tmp_path / "temp")

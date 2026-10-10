@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from datetime import datetime, timezone
@@ -19,14 +20,38 @@ logger = logging.getLogger(__name__)
 # Read first + last N bytes for file fingerprint
 _HEAD_TAIL_BYTES = 10 * 1024 * 1024  # 10 MB
 
-# Fingerprint memo: (size, mtime_ns) -> fingerprint dict. Computing a
-# fingerprint reads 20 MB and spawns an ffprobe subprocess (~145 ms), while a
-# stat() costs ~0.01 ms. Keying on stat output lets repeated calls for an
-# unchanged file (build_queue, then mark_done) reuse the earlier result while
-# still recomputing whenever the file actually changes.
-_FINGERPRINT_CACHE: dict[tuple, dict] = {}
+# Bytes read from each end to confirm a cached entry still describes the file.
+# Small enough to be effectively free (~0.1 ms) next to the real fingerprint's
+# 20 MB read + ffprobe subprocess.
+_QUICK_CHECK_BYTES = 256 * 1024
+
+# Fingerprint memo: (path, size, mtime_ns, st_ino)
+#   -> (created_at, quick_hash, fingerprint).
+# Computing a fingerprint reads 20 MB and spawns an ffprobe subprocess
+# (~145 ms), while a stat() costs ~0.01 ms. Keying on stat output lets repeated
+# calls for an unchanged file (build_queue, then mark_done) reuse the earlier
+# result while still recomputing whenever the file actually changes.
+_FINGERPRINT_CACHE: dict[tuple, tuple[float, str, dict]] = {}
 # Bound the memo so a long batch over a huge library cannot grow it without end.
 _FINGERPRINT_CACHE_MAX = 4096
+# Backstop for a rewrite that fools every cheap check: content changed only in
+# the middle of a large file, with size and mtime restored. The memo exists to
+# avoid recomputing inside one run; it should not outlive that.
+_FINGERPRINT_CACHE_TTL_SECONDS = 300.0
+
+
+def _quick_hash(path: Path, size: int) -> str:
+    """Cheap content token: a hash of the file's first and last 256 KB."""
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as handle:
+            digest.update(handle.read(_QUICK_CHECK_BYTES))
+            if size > _QUICK_CHECK_BYTES * 2:
+                handle.seek(-_QUICK_CHECK_BYTES, 2)
+                digest.update(handle.read(_QUICK_CHECK_BYTES))
+    except OSError:
+        return ""
+    return digest.hexdigest()
 
 
 def _file_fingerprint(path: Path) -> dict | None:
@@ -35,19 +60,39 @@ def _file_fingerprint(path: Path) -> dict | None:
         stat = path.stat()
         size = stat.st_size
         mtime = int(stat.st_mtime)
-        cache_key = (str(path), size, stat.st_mtime_ns)
+        # st_ino is the platform's file identity (NTFS file index on Windows).
+        # Size + mtime alone are forgeable: a delete-and-recreate that restores
+        # both would otherwise be served a stale fingerprint and be skipped.
+        # It is 0 on filesystems that do not report it, which just keeps the
+        # old behaviour there.
+        cache_key = (str(path), size, stat.st_mtime_ns, getattr(stat, "st_ino", 0))
     except OSError:
         return None
 
     cached = _FINGERPRINT_CACHE.get(cache_key)
     if cached is not None:
-        return dict(cached)
+        created_at, quick_hash, fingerprint = cached
+        # An in-place rewrite keeps the inode and can restore size + mtime, so
+        # the key alone cannot prove the content is unchanged. Re-read the two
+        # ends and compare: cheap, and enough to catch a real replacement.
+        if (
+            time.monotonic() - created_at <= _FINGERPRINT_CACHE_TTL_SECONDS
+            and quick_hash == _quick_hash(path, size)
+        ):
+            return dict(fingerprint)
+        del _FINGERPRINT_CACHE[cache_key]
 
     result = _compute_fingerprint(path, size, mtime)
     if result is not None:
         if len(_FINGERPRINT_CACHE) >= _FINGERPRINT_CACHE_MAX:
             _FINGERPRINT_CACHE.clear()
-        _FINGERPRINT_CACHE[cache_key] = result
+        # Hashed once when the fingerprint is computed, so the cheap check on
+        # every later hit costs one small read and nothing else.
+        _FINGERPRINT_CACHE[cache_key] = (
+            time.monotonic(),
+            _quick_hash(path, size),
+            result,
+        )
     return dict(result) if result is not None else None
 
 

@@ -24,7 +24,11 @@ import time
 from src.config import PipelineConfig
 from src.translator import create_translator, translate_srt_with_outputs
 from src.utils import scan_video_files
-from src.audio_extractor import AudioExtractor
+from src.audio_extractor import (
+    AudioExtractionCancelled,
+    AudioExtractionError,
+    AudioExtractor,
+)
 from src.gpu_scheduler import GpuScheduler
 from src.text_formatter import Segment, TextFormatter, set_cps_language
 from src.task_manager import TaskManager
@@ -75,6 +79,7 @@ def run_one_video(
     *,
     progress_callback: callable = None,
     cancel_event: threading.Event = None,
+    translation_targets: list[tuple[Path, str]] | None = None,
 ) -> tuple[bool, int, str]:
     """
     Process a single media file through the full pipeline.
@@ -84,13 +89,22 @@ def run_one_video(
         video_path: Path to the source media file.
         progress_callback: Optional callable(stage, current, total) for progress.
         cancel_event: Optional threading.Event; set to request graceful stop.
+        translation_targets: Optional list that receives
+            ``(srt_path, detected_language)`` for every subtitle written by
+            this run. Callers use it to translate exactly the files produced
+            here instead of rescanning the output directory.
 
     Returns:
         (success, segment_count, error_message)
     """
     _check_cancelled = lambda: cancel_event and cancel_event.is_set()
     temp_dir = config.effective_temp_dir
-    extractor = AudioExtractor(temp_dir)
+    extractor = AudioExtractor(
+        temp_dir,
+        # getattr: tests and older callers pass lightweight config stand-ins.
+        ffmpeg_bin=getattr(config, "ffmpeg_path", "") or None,
+        ffprobe_bin=getattr(config, "ffprobe_path", "") or None,
+    )
 
     # --- Stage 1: Audio extraction + chunking ---
     if _check_cancelled():
@@ -105,8 +119,20 @@ def run_one_video(
         extract_kwargs["progress_callback"] = (
             lambda fraction: _emit_stage(progress_callback, "extracting", fraction)
         )
+    if cancel_event is not None:
+        # Handing the event down lets a stop request kill ffmpeg instead of
+        # waiting for a long (or hung) extraction to finish on its own.
+        extract_kwargs["cancel_event"] = cancel_event
     try:
         wav_path = extractor.extract(video_path, **extract_kwargs)
+    except AudioExtractionCancelled:
+        # A half-written WAV would poison the cache on the next run.
+        if config.cleanup_temp:
+            try:
+                _cleanup_temp_audio(extractor.wav_path_for(video_path))
+            except AudioExtractionError:
+                pass
+        return (False, 0, "Cancelled during extraction")
     except Exception as exc:
         return (False, 0, str(exc))
 
@@ -123,8 +149,14 @@ def run_one_video(
             split_kwargs["progress_callback"] = (
                 lambda fraction: _emit_stage(progress_callback, "splitting", fraction)
             )
+        if cancel_event is not None:
+            split_kwargs["cancel_event"] = cancel_event
         try:
             chunks = extractor.split_wav(wav_path, chunk_sec, **split_kwargs)
+        except AudioExtractionCancelled:
+            if config.cleanup_temp:
+                _cleanup_temp_audio(wav_path)
+            return (False, 0, "Cancelled during splitting")
         except Exception as exc:
             if config.cleanup_temp:
                 _cleanup_temp_audio(wav_path)
@@ -143,10 +175,14 @@ def run_one_video(
     scheduler_tasks = [(cp, video_path) for _, cp in chunks]
     scheduler = GpuScheduler(config)
     start_time = time.time()
+    # Filled with one reason per failed chunk, including chunks a dead worker
+    # never answered for — otherwise "some chunks failed" is all we can say.
+    chunk_errors: dict[Path, str] = {}
 
     try:
         raw_results = scheduler.process(
             scheduler_tasks,
+            error_sink=chunk_errors,
             progress_callback=(
                 lambda fraction: _emit_stage(
                     progress_callback, "transcribing", fraction
@@ -184,13 +220,27 @@ def run_one_video(
             chunk_segments, detected_language = raw_results[chunk_path]
             chunk_results.append((offset, chunk_segments))
             detected_languages.append(detected_language)
-        else:
-            all_done = False
+            continue
+        all_done = False
+        reason = chunk_errors.get(chunk_path, "no result returned by the GPU worker")
+        logger.error(
+            "Transcription failed for %s (offset %ss): %s",
+            chunk_path.name, offset, reason,
+        )
 
     if not all_done or not chunk_results:
         if config.cleanup_temp:
             _cleanup_temp_audio(wav_path)
-        return (False, 0, "Some chunks failed transcription")
+        failed_chunks = [c for c in chunks if c[1] not in raw_results]
+        first_reason = chunk_errors.get(
+            failed_chunks[0][1], "no result returned by the GPU worker"
+        ) if failed_chunks else ""
+        return (
+            False,
+            0,
+            f"{len(failed_chunks)}/{len(chunks)} chunk(s) failed transcription"
+            + (f": {first_reason}" if first_reason else ""),
+        )
 
     if len(chunk_results) > 1:
         segments = formatter.combine_chunk_segments(chunk_results)
@@ -218,6 +268,21 @@ def run_one_video(
             base_path=video_out_dir / video_path.stem,
             formats=config.output_formats,
         )
+
+        # Hand the caller the exact file this run produced, together with the
+        # language Whisper actually detected. A later translation pass uses it
+        # instead of rescanning the output directory, which would also pick up
+        # old subtitles, previous translations and source copies.
+        if (
+            translation_targets is not None
+            and config.translate_to
+            and config.translation_provider == "llm"
+        ):
+            srt_written = next(
+                (p for p in written if p.suffix.lower() == ".srt"), None
+            )
+            if srt_written is not None:
+                translation_targets.append((srt_written, detected_language))
 
         # --- Stage 3b: Translation (optional) ---
         # The local LLM backend runs as a separate pass after all ASR work
@@ -288,31 +353,53 @@ def _on_sigint(signum, frame):
     _shutdown_requested = True
 
 
-def _run_llm_translation_pass(config: PipelineConfig) -> int:
-    """Translate all pending SRTs with the local LLM, exclusively on the GPU.
+def _run_llm_translation_pass(
+    config: PipelineConfig,
+    targets: list[tuple[Path, str]],
+) -> int:
+    """Translate this run's SRTs with the local LLM, exclusively on the GPU.
 
     Called after the ASR loop so Whisper workers have already released their
     VRAM; the translator probes free VRAM at load time and sizes its context
     and batch-token budget accordingly (1GB safety margin included).
+
+    *targets* is the list ASR reported as newly written, as
+    ``(srt_path, detected_language)`` pairs. Nothing is inferred by scanning
+    the output directory, so pre-existing subtitles, earlier translations and
+    source copies are never re-translated.
     Returns the number of failures.
     """
     from src.translator.llm import LlmTranslator
 
-    srt_paths = sorted(config.output_dir.glob("*.srt"))
-    # Only fresh outputs from this run need translation; a marker file keeps
-    # the pass idempotent across reruns.
-    pending = [
-        p for p in srt_paths
-        if not p.stem.endswith(tuple(f".{s}" for s in ("bilingual",)))
-        and ".bilingual" not in p.stem
-    ]
+    # De-duplicate while preserving order: the same file can only reach the
+    # list once, but a defensive pass costs nothing.
+    pending: list[tuple[Path, str]] = []
+    seen: set[Path] = set()
+    for srt_path, language in targets:
+        if srt_path in seen:
+            continue
+        seen.add(srt_path)
+        pending.append((srt_path, language))
+
     if not pending:
         logger.info("LLM translation pass: nothing to translate")
         return 0
 
+    # Skip files whose translation outputs are already on disk, so a rerun
+    # after a partial failure only redoes the missing part.
+    todo: list[tuple[Path, str]] = []
+    for srt_path, language in pending:
+        if _translation_outputs_present(config, srt_path):
+            logger.info("LLM translation already present, skipping: %s", srt_path.name)
+            continue
+        todo.append((srt_path, language))
+    if not todo:
+        logger.info("LLM translation pass: every subtitle is already translated")
+        return 0
+
     logger.info(
         "LLM translation pass: %d subtitle file(s); ASR finished, "
-        "loading local model with exclusive VRAM access", len(pending),
+        "loading local model with exclusive VRAM access", len(todo),
     )
     failed = 0
     provider = None
@@ -325,27 +412,49 @@ def _run_llm_translation_pass(config: PipelineConfig) -> int:
         provider = LlmTranslator()
     except Exception as exc:
         logger.error("Failed to initialize local translation model: %s", exc)
-        return len(pending)
+        return len(todo)
 
-    for srt_path in pending:
-        if _shutdown_requested:
-            break
-        logger.info("LLM translating: %s → %s", srt_path.name, config.translate_to)
+    try:
+        for srt_path, language in todo:
+            if _shutdown_requested:
+                break
+            logger.info("LLM translating: %s → %s", srt_path.name, config.translate_to)
+            try:
+                translate_srt_with_outputs(
+                    srt_path,
+                    config.translate_to,
+                    provider=provider,
+                    source_lang=language or config.language,
+                    swap_subtitles=config.swap_subtitles,
+                )
+            except Exception as exc:
+                failed += 1
+                logger.error("LLM translation failed for %s: %s", srt_path.name, exc)
+    finally:
+        # Give the VRAM back so the desktop / other tools get a clean GPU even
+        # when a translation raised.
         try:
-            translate_srt_with_outputs(
-                srt_path,
-                config.translate_to,
-                provider=provider,
-                source_lang=config.language,
-                swap_subtitles=config.swap_subtitles,
-            )
-        except Exception as exc:
-            failed += 1
-            logger.error("LLM translation failed for %s: %s", srt_path.name, exc)
-    # Give the VRAM back so the desktop / other tools get a clean GPU.
-    provider.release()
+            provider.release()
+        except Exception:
+            logger.debug("Releasing the translation model failed", exc_info=True)
     logger.info("LLM translation pass complete (%d failure(s))", failed)
     return failed
+
+
+def _translation_outputs_present(config: PipelineConfig, srt_path: Path) -> bool:
+    """True when this SRT already has the translation outputs enabled by config."""
+    from src.utils import is_srt_valid
+
+    if not is_srt_valid(srt_path):
+        return False
+    if not config.swap_subtitles:
+        from src.translator.types import iso_to_player_suffix
+
+        target = srt_path.with_stem(
+            f"{srt_path.stem}.{iso_to_player_suffix(config.translate_to)}"
+        )
+        return is_srt_valid(target)
+    return is_srt_valid(srt_path.with_stem(f"{srt_path.stem}.bilingual"))
 
 
 def _exit_code(*, failed_count: int, done_count: int, interrupted: bool) -> int:
@@ -488,19 +597,27 @@ def main():
     total_segments = 0
     failed_count = 0
     start_time = time.time()
+    # Filled by run_one_video: exactly the subtitles this run produced, each
+    # paired with the language ASR detected for it.
+    translation_targets: list[tuple[Path, str]] = []
 
     for task in tasks:
         if _shutdown_requested:
             break
         task_mgr.mark_started(task.video_path)
         try:
-            ok, seg_count, err = run_one_video(config, task.video_path)
+            ok, seg_count, err = run_one_video(
+                config, task.video_path, translation_targets=translation_targets
+            )
         except Exception as exc:
             logger.exception("Unhandled pipeline error for %s", task.video_path.name)
             ok, seg_count, err = False, 0, str(exc)
         if ok:
             task_mgr.mark_done(task.video_path)
             total_segments += seg_count
+        elif err.startswith("Cancelled"):
+            # A user stop is not a media failure: keep the task retryable.
+            logger.warning("%s: %s", task.video_path.name, err)
         else:
             task_mgr.mark_failed(task.video_path, err)
             failed_count += 1
@@ -514,7 +631,7 @@ def main():
         and not _shutdown_requested
         and task_mgr.done_count == task_mgr.total_count
     ):
-        failed_count += _run_llm_translation_pass(config)
+        failed_count += _run_llm_translation_pass(config, translation_targets)
 
     elapsed = time.time() - start_time
 

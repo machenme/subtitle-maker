@@ -31,6 +31,43 @@ def _default_model_path(model_size: str) -> str:
     return f"./models/faster-whisper-{model_size}-ct2"
 
 
+_TRUE_STRINGS = {"true", "1", "yes", "on"}
+_FALSE_STRINGS = {"false", "0", "no", "off"}
+
+
+def _as_int(value: Any, default: int, key: str) -> int:
+    """Coerce a config value to int, or explain which key is wrong."""
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        raise ValueError(f"{key} must be an integer, got {value!r}")
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be an integer, got {value!r}") from exc
+
+
+def _as_bool(value: Any, default: bool, key: str) -> bool:
+    """Coerce a config value to bool, or explain which key is wrong.
+
+    YAML already yields real booleans; a quoted ``"false"`` is the trap this
+    catches, since ``bool("false")`` is ``True``.
+    """
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _TRUE_STRINGS:
+            return True
+        if normalized in _FALSE_STRINGS:
+            return False
+    raise ValueError(f"{key} must be a boolean, got {value!r}")
+
+
 # ---------------------------------------------------------------------------
 # Legacy worker-count helper
 # ---------------------------------------------------------------------------
@@ -85,6 +122,10 @@ class PipelineConfig:
     swap_subtitles: bool = True  # write translated .srt, bilingual, and original subtitles
     cleanup_temp: bool = True
     verbose: bool = False
+    # ffmpeg/ffprobe override: a file path or the folder holding the .exe.
+    # "" = auto-detect (PATH → persisted PATH → winget/scoop/choco install dirs).
+    ffmpeg_path: str = ""
+    ffprobe_path: str = ""
 
     # ------------------------------------------------------------------
     # Factory
@@ -151,13 +192,27 @@ class PipelineConfig:
             model_path = (config_dir / model_path).resolve()
 
         language = _cli_or_yaml("language", default="auto")
-        beam_size = int(_cli_or_yaml("beam_size", default=5))
-        vad_filter = cli.get("vad_filter", raw.get("vad_filter", True))
+        beam_size = _as_int(_cli_or_yaml("beam_size", default=5), 5, "beam_size")
+        vad_filter = _as_bool(
+            cli.get("vad_filter", raw.get("vad_filter", True)), True, "vad_filter"
+        )
         compute_type = _cli_or_yaml("compute_type", default="float16")
-        max_workers = int(_cli_or_yaml("workers", "max_workers", DEFAULT_MAX_WORKERS))
-        chunk_duration = int(_cli_or_yaml("chunk_duration", default=0))
+        # A YAML ``max_workers: null`` means "use the default", not "zero".
+        max_workers = _as_int(
+            _cli_or_yaml("workers", "max_workers", DEFAULT_MAX_WORKERS),
+            DEFAULT_MAX_WORKERS,
+            "max_workers",
+        )
+        chunk_duration = _as_int(_cli_or_yaml("chunk_duration", default=0), 0, "chunk_duration")
         video_extensions = _cli_or_yaml("video_extensions", default=DEFAULT_VIDEO_EXTENSIONS)
         output_formats = _cli_or_yaml("output_formats", default=["srt"])
+        # A bare `output_formats: srt` would otherwise become ['s', 'r', 't'].
+        for key, value in (
+            ("video_extensions", video_extensions),
+            ("output_formats", output_formats),
+        ):
+            if isinstance(value, str):
+                raise ValueError(f"{key} must be a list, got the string {value!r}")
         if cli.get("translate_to") is not None:
             translate_to = cli["translate_to"]
         else:
@@ -177,9 +232,23 @@ class PipelineConfig:
             if cli.get("translation_model_path") is not None
             else raw.get("translation_model_path", "")
         )
-        swap_subtitles = cli.get("swap_subtitles", raw.get("swap_subtitles", True))
-        cleanup_temp = cli.get("cleanup_temp", raw.get("cleanup_temp", True))
-        verbose = cli.get("verbose", raw.get("verbose", False))
+        swap_subtitles = _as_bool(
+            cli.get("swap_subtitles", raw.get("swap_subtitles", True)), True, "swap_subtitles"
+        )
+        cleanup_temp = _as_bool(
+            cli.get("cleanup_temp", raw.get("cleanup_temp", True)), True, "cleanup_temp"
+        )
+        verbose = _as_bool(cli.get("verbose", raw.get("verbose", False)), False, "verbose")
+        ffmpeg_path = (
+            cli.get("ffmpeg_path")
+            if cli.get("ffmpeg_path") is not None
+            else raw.get("ffmpeg_path", "")
+        ) or ""
+        ffprobe_path = (
+            cli.get("ffprobe_path")
+            if cli.get("ffprobe_path") is not None
+            else raw.get("ffprobe_path", "")
+        ) or ""
 
         cfg = cls(
             input_dir=Path(input_dir) if not isinstance(input_dir, Path) else input_dir,
@@ -202,6 +271,8 @@ class PipelineConfig:
             swap_subtitles=swap_subtitles,
             cleanup_temp=cleanup_temp,
             verbose=verbose,
+            ffmpeg_path=str(ffmpeg_path),
+            ffprobe_path=str(ffprobe_path),
         )
         cfg.validate()
         return cfg
@@ -216,6 +287,10 @@ class PipelineConfig:
 
         if not self.input_dir.exists():
             errors.append(f"Input directory does not exist: {self.input_dir}")
+        elif not self.input_dir.is_dir():
+            # A file path scans to zero media files and the run then reports
+            # "nothing to do" instead of pointing at the mistyped setting.
+            errors.append(f"input_dir must be a directory, not a file: {self.input_dir}")
         if self.beam_size < 1 or self.beam_size > 10:
             errors.append(f"beam_size must be 1-10, got {self.beam_size}")
         if self.max_workers < 1 or self.max_workers > DEFAULT_MAX_WORKERS:
@@ -255,6 +330,7 @@ class PipelineConfig:
                 "translation_provider='index_api' needs translation_proxy "
                 "(e.g. 127.0.0.1:7897) to reach the public endpoint"
             )
+        errors.extend(self._validate_value_types())
 
         if errors:
             raise ValueError("Configuration errors:\n  - " + "\n  - ".join(errors))
@@ -262,6 +338,39 @@ class PipelineConfig:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _validate_value_types(self) -> list[str]:
+        """Catch list/string/bool settings that only fail deep in the pipeline."""
+        errors: list[str] = []
+
+        def _string_list(key: str, value: Any) -> None:
+            if isinstance(value, str) or not isinstance(value, (list, tuple, set)):
+                errors.append(
+                    f"{key} must be a list of extensions, got {type(value).__name__}: {value!r}"
+                )
+                return
+            bad = [item for item in value if not isinstance(item, str) or not item.strip()]
+            if bad:
+                errors.append(f"{key} must contain non-empty strings, got {bad!r}")
+
+        _string_list("video_extensions", self.video_extensions)
+        _string_list("output_formats", self.output_formats)
+
+        for key in ("vad_filter", "swap_subtitles", "cleanup_temp", "verbose"):
+            if not isinstance(getattr(self, key), bool):
+                errors.append(
+                    f"{key} must be a boolean, got {getattr(self, key)!r}"
+                )
+        for key in ("language", "compute_type", "model_size", "translate_to",
+                    "translation_provider", "translation_proxy",
+                    "translation_model_path"):
+            if not isinstance(getattr(self, key), str):
+                errors.append(
+                    f"{key} must be a string, got {getattr(self, key)!r}"
+                )
+        if not str(self.language).strip():
+            errors.append("language must be an ISO 639-1 code or 'auto'")
+        return errors
 
     def _validate_translation_model_path(self) -> list[str]:
         """Check the custom translation GGUF path.

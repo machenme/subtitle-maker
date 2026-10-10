@@ -99,6 +99,7 @@ def test_duration_probe_start_returns_immediately(tmp_path: Path):
     assert probe.wait(timeout=30) is True, "probe did not finish"
 
 
+@pytest.mark.needs_ffprobe
 def test_duration_probe_reports_every_file(app, tmp_path: Path):
     paths = [_write_wav(tmp_path / f"s{i}.wav", seconds=i + 1) for i in range(3)]
 
@@ -130,6 +131,16 @@ def test_duration_probe_tolerates_unreadable_file(tmp_path: Path):
     probe = DurationProbe([broken, good])
     probe.start()
     assert probe.wait(timeout=30) is True
+
+
+def test_duration_probe_tolerates_missing_ffprobe(monkeypatch, tmp_path: Path):
+    import src.gui as gui_module
+
+    def missing_ffprobe(*args, **kwargs):
+        raise FileNotFoundError("ffprobe")
+
+    monkeypatch.setattr(gui_module.subprocess, "run", missing_ffprobe)
+    assert DurationProbe([])._format_duration(tmp_path / "clip.mp4") == "?"
 
 
 def test_add_file_shows_placeholder_instead_of_blocking(window, app, tmp_path: Path):

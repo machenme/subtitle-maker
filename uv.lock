@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.11, <3.13"
 resolution-markers = [
     "python_full_version >= '3.12'",
@@ -36,45 +36,6 @@ sdist = { url = "https://chinanet.mirrors.ustc.edu.cn/pypi/packages/1c/b5/001890
 wheels = [
     { url = "https://chinanet.mirrors.ustc.edu.cn/pypi/packages/ba/16/9826f089383c593cdfc4a6e5aca94d9e91ae1692c57af82c3b2aa5e810f7/anyio-4.14.0-py3-none-any.whl", hash = "sha256:dd9b7a2a9799ed6552fde617b2c5df02b7fdd7d88392fc48101e51bae46164d9", size = 123506, upload-time = "2026-06-15T22:00:47.595Z" },
 ]
-
-[[package]]
-name = "subtitle-maker"
-version = "1.0.0"
-source = { virtual = "." }
-dependencies = [
-    { name = "faster-whisper" },
-    { name = "llama-cpp-python" },
-    { name = "nvidia-cublas-cu12" },
-    { name = "nvidia-cuda-runtime-cu12" },
-    { name = "nvidia-ml-py" },
-    { name = "pyside6" },
-    { name = "python-dotenv" },
-    { name = "pyyaml" },
-    { name = "requests" },
-    { name = "tqdm" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "pyinstaller" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "faster-whisper", specifier = ">=1.0.0" },
-    { name = "llama-cpp-python", specifier = ">=0.3.35" },
-    { name = "nvidia-cublas-cu12", specifier = ">=12.0.0" },
-    { name = "nvidia-cuda-runtime-cu12", specifier = ">=12.0.0" },
-    { name = "nvidia-ml-py", specifier = ">=12.0.0" },
-    { name = "pyside6", specifier = ">=6.8.0" },
-    { name = "python-dotenv", specifier = ">=1.0.1" },
-    { name = "pyyaml", specifier = ">=6.0" },
-    { name = "requests", specifier = ">=2.32.0" },
-    { name = "tqdm", specifier = ">=4.66.0" },
-]
-
-[package.metadata.requires-dev]
-dev = [{ name = "pyinstaller", specifier = ">=6.21.0" }]
 
 [[package]]
 name = "av"
@@ -764,6 +725,45 @@ wheels = [
     { url = "https://chinanet.mirrors.ustc.edu.cn/pypi/packages/52/b5/3f6fb2ee65b534193fb4ef713dd619dc31dadff5d12c16979a7699ad58be/shiboken6-6.11.1-cp310-abi3-win_amd64.whl", hash = "sha256:c2c6863aa80ec18c0f82cea3417837b279cdc60024ac17123461dc9042577df7", size = 1223647, upload-time = "2026-05-13T09:47:05.924Z" },
     { url = "https://chinanet.mirrors.ustc.edu.cn/pypi/packages/98/d1/f15ca0e1666faae02c945f48e745ea35f8fcd8243b176109b4e2c4251f47/shiboken6-6.11.1-cp310-abi3-win_arm64.whl", hash = "sha256:7c8d9af17db4495d4fa5b1c393f218311c4855546b9dfa6a0bd21bcd66b55e9d", size = 1784170, upload-time = "2026-05-13T09:47:07.617Z" },
 ]
+
+[[package]]
+name = "subtitle-maker"
+version = "1.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "faster-whisper" },
+    { name = "llama-cpp-python" },
+    { name = "nvidia-cublas-cu12" },
+    { name = "nvidia-cuda-runtime-cu12" },
+    { name = "nvidia-ml-py" },
+    { name = "pyside6" },
+    { name = "python-dotenv" },
+    { name = "pyyaml" },
+    { name = "requests" },
+    { name = "tqdm" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pyinstaller" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "faster-whisper", specifier = ">=1.0.0" },
+    { name = "llama-cpp-python", specifier = ">=0.3.35" },
+    { name = "nvidia-cublas-cu12", specifier = ">=12.0.0" },
+    { name = "nvidia-cuda-runtime-cu12", specifier = ">=12.0.0" },
+    { name = "nvidia-ml-py", specifier = ">=12.0.0" },
+    { name = "pyside6", specifier = ">=6.8.0" },
+    { name = "python-dotenv", specifier = ">=1.0.1" },
+    { name = "pyyaml", specifier = ">=6.0" },
+    { name = "requests", specifier = ">=2.32.0" },
+    { name = "tqdm", specifier = ">=4.66.0" },
+]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pyinstaller", specifier = ">=6.21.0" }]
 
 [[package]]
 name = "tokenizers"
