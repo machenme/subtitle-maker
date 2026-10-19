@@ -101,6 +101,134 @@ def test_untranslated_srt_in_custom_output_directory_is_queued_for_translation(t
     ) == "translate_output"
 
 
+def test_rerun_after_failed_translation_only_translates(tmp_path: Path, monkeypatch):
+    """Subtitles exist, translation missing: translate them, never re-run ASR."""
+    media_path = tmp_path / "input" / "sample.mp4"
+    output_dir = tmp_path / "output"
+    media_path.parent.mkdir()
+    output_dir.mkdir()
+    media_path.write_bytes(b"\x00" * 512)
+    (output_dir / "sample.srt").write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\n"
+        "A valid subtitle line for this test.\n",
+        encoding="utf-8",
+    )
+
+    config = SimpleNamespace(
+        translate_to="zh",
+        output_dir=output_dir,
+        language="ja",
+        swap_subtitles=True,
+        translation_provider="index_api",
+        translation_proxy="",
+        translation_model_path="",
+    )
+    worker = PipelineWorker([media_path], {}, config, threading.Event())
+    statuses: list[str] = []
+    logs: list[str] = []
+    worker.file_status.connect(lambda _path, status: statuses.append(status))
+    worker.log.connect(logs.append)
+    translated: list[Path] = []
+
+    monkeypatch.setattr(
+        "src.gui.run_one_video",
+        lambda *args, **kwargs: pytest.fail("ASR must not run again"),
+    )
+    monkeypatch.setattr("src.gui.create_translator", lambda *a, **k: object())
+    monkeypatch.setattr(
+        "src.gui.translate_srt_with_outputs",
+        lambda srt_path, *args, **kwargs: (
+            translated.append(srt_path), srt_path, None, None
+        )[-3:],
+    )
+
+    worker.run()
+
+    assert translated == [output_dir / "sample.srt"]
+    assert "等待翻译" in statuses
+    assert any("跳过转写" in line for line in logs)
+
+
+def _media_with_subtitles(tmp_path: Path, index: int) -> Path:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir(exist_ok=True)
+    media = tmp_path / f"v{index}.mp4"
+    media.write_bytes(b"\x00" * 512)
+    (output_dir / f"v{index}.srt").write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\n"
+        "A valid subtitle line for this test.\n",
+        encoding="utf-8",
+    )
+    return media
+
+
+def _translation_failure_worker(tmp_path: Path, count: int):
+    output_dir = tmp_path / "output"
+    paths = [_media_with_subtitles(tmp_path, i) for i in range(count)]
+    config = SimpleNamespace(
+        translate_to="zh",
+        output_dir=output_dir,
+        language="ja",
+        swap_subtitles=True,
+        translation_provider="index_api",
+        translation_proxy="",
+        translation_model_path="",
+    )
+    cancel = threading.Event()
+    return PipelineWorker(paths, {}, config, cancel), cancel, paths
+
+
+def test_repeated_translation_failures_stop_the_run_and_alert(tmp_path: Path, monkeypatch):
+    """A backend that keeps failing must not grind through the whole queue."""
+    worker, cancel, paths = _translation_failure_worker(tmp_path, 4)
+    alerts: list[str] = []
+    statuses: list[str] = []
+    worker.alert.connect(alerts.append)
+    worker.file_status.connect(lambda _path, status: statuses.append(status))
+
+    def boom(srt_path, *args, **kwargs):
+        kwargs["on_batch_error"](TranslationError("Index API HTTP 504"))
+        raise TranslationError("Index API HTTP 504")
+
+    monkeypatch.setattr("src.gui.create_translator", lambda *a, **k: object())
+    monkeypatch.setattr("src.gui.translate_srt_with_outputs", boom)
+
+    worker.run()
+    # Translations run on their own thread, so their signals are queued and
+    # only land once the Qt event loop turns.
+    _flush_qt_events()
+
+    assert len(alerts) == 1, "one dialog, not one per failed file"
+    assert "504" in alerts[0] and "已停止" in alerts[0]
+    assert cancel.is_set()
+    # The file after the third failure is never translated.
+    assert statuses.count("已停止") == 1
+
+
+def test_a_successful_translation_resets_the_failure_streak(tmp_path: Path, monkeypatch):
+    worker, cancel, _paths = _translation_failure_worker(tmp_path, 4)
+    alerts: list[str] = []
+    worker.alert.connect(alerts.append)
+    attempts = {"n": 0}
+
+    def alternate(srt_path, *args, **kwargs):
+        attempts["n"] += 1
+        if attempts["n"] % 2 == 0:
+            kwargs["progress_callback"](1.0)
+            return srt_path, None, None
+        kwargs["on_batch_error"](TranslationError("Index API HTTP 504"))
+        raise TranslationError("Index API HTTP 504")
+
+    monkeypatch.setattr("src.gui.create_translator", lambda *a, **k: object())
+    monkeypatch.setattr("src.gui.translate_srt_with_outputs", alternate)
+
+    worker.run()
+    _flush_qt_events()
+
+    assert alerts == []
+    assert not cancel.is_set()
+
+
 def test_queue_summary_reports_asr_and_translation_stages():
     summary = AsrWindow._queue_summary_text(
         ["asr", "处理中", "翻译中", "等待翻译", "完成 · 已翻译"]

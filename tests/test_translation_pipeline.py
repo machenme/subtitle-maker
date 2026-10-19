@@ -124,6 +124,11 @@ class FailingBatchProvider:
 
 
 def test_translation_stops_submitting_batches_after_failure(tmp_path: Path):
+    """A batch that cannot be translated must not drag the rest down with it.
+
+    Retries are disabled here so the assertion stays about submission, not
+    about how many times the same batch was attempted.
+    """
     source = tmp_path / "sample.srt"
     source.write_text(
         "1\n00:00:01,000 --> 00:00:03,000\n第一条\n\n"
@@ -138,14 +143,19 @@ def test_translation_stops_submitting_batches_after_failure(tmp_path: Path):
             source,
             "zh",
             provider=provider,
-            config=TranslateConfig(batch_size=1, max_workers=2, request_delay=0),
+            config=TranslateConfig(
+                batch_size=1,
+                max_workers=2,
+                request_delay=0,
+                batch_retries=0,
+            ),
         )
     except TranslationError:
         pass
     else:
         raise AssertionError("Expected translation to fail")
 
-    assert len(provider.calls) == 1
+    assert provider.calls == [["第一条"]]
 
 
 def test_edge_batch_uses_one_json_request_and_preserves_order(monkeypatch):

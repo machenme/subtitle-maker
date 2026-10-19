@@ -111,6 +111,8 @@
 | 9 | 配置校验不完整 | `input_dir` 必须是目录；`video_extensions` / `output_formats` 必须是字符串列表（字符串会报错而不是被拆成字符）；布尔项支持 `"false"` 这类引号值并拒绝非法值；数值项 `null` 回落默认值。顺带修掉 `config.yaml` 里 `max_workers: null` 导致 `int(None)` 崩溃的真实故障 |
 | 10 | 指纹缓存无法识别原地替换 | 缓存键加 `st_ino`（识别删除重建/改名替换）；命中时再读首尾各 256KB 做快速校验，内容变了就重算；另有 300s TTL 兜底。**残余限制**：只有中间部分变化、且首尾 256KB 与大小/mtime 都不变时，仍要等 TTL 到期；彻底消除须每次重算内容哈希 |
 | 11 | 翻译失败后仍在等在途请求 | 失败时对已发出的请求做有界等待（`_FAILURE_DRAIN_TIMEOUT` = 30s）；在窗口内完成的请求会被等到（provider 不会被孤立使用），超时仍有残留时打 warning 明确提示「不要马上释放 provider」，之后 `shutdown(wait=False)` |
+| 12 | Index API 偶发 504 导致整个文件翻译失败 | 网关超时/5xx/连接错误归为可重试错误：同一请求重试 1 次（重试用更短的 60s 超时，避免卡满 120s），仍失败就把打包请求对半拆开再发；`TranslateConfig` 另加批次级兜底重试（`batch_retries=2`，退避 `retry_delay`）。回归测试见 `tests/test_index_api_retry.py`。**残余限制**：某个批次彻底失败仍会放弃整个文件（不写出半译文），这是刻意保留的对齐保证 |
+| 13 | 翻译后端持续报错时仍在跑完整个队列 | `translate_srt` / `translate_srt_with_outputs` 新增 `on_batch_error` 回调（批次重试耗尽才触发）；GUI worker 连续 3 个批次失败即 `cancel_event.set()` + `alert` 信号弹 `QMessageBox`，剩余文件标「已停止」；CLI 连续 3 个文件翻译失败即终止并汇总说明。另：`TransientTranslationError` 提到 `types.py`，管线不再二次重试 provider 已重试过的错误，避免失败前空耗数分钟 |
 
 ## 本次触发问题的处理状态
 

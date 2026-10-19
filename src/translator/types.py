@@ -17,6 +17,16 @@ class TranslationError(Exception):
     """Raised when a translation provider fails irrecoverably."""
 
 
+class TransientTranslationError(TranslationError):
+    """A provider failure the provider already retried (timeout, 5xx, rate limit).
+
+    Subclasses :class:`TranslationError`, so callers that catch the base class
+    behave unchanged. Callers that *retry* use it to stop: the provider has
+    spent its own attempts and its fallbacks (smaller requests) already, so
+    another attempt at this level only burns more time.
+    """
+
+
 class ParseError(Exception):
     """Raised when SRT parsing fails (malformed input)."""
 
@@ -83,6 +93,11 @@ class TranslateConfig:
     batch_size: int = 50
     max_workers: int = 2
     request_delay: float = 3.0   # seconds between batch submissions (Bing rate-limit)
+    # Extra attempts for a batch whose provider call failed. Providers retry
+    # their own transient HTTP errors already; this catches everything else
+    # (malformed responses, rate-limit bursts) before the whole file is lost.
+    batch_retries: int = 2
+    retry_delay: float = 2.0     # backoff between those attempts, × attempt
     token_ttl: int = 480         # seconds before token refresh
 
     @classmethod
@@ -118,6 +133,10 @@ class TranslateConfig:
             raise ValueError("max_workers must be >= 1")
         if self.request_delay < 0:
             raise ValueError("request_delay must be >= 0")
+        if self.batch_retries < 0:
+            raise ValueError("batch_retries must be >= 0")
+        if self.retry_delay < 0:
+            raise ValueError("retry_delay must be >= 0")
         if self.token_ttl < 60:
             raise ValueError("token_ttl must be >= 60")
 

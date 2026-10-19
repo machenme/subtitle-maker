@@ -371,8 +371,17 @@ STAGE_LABELS = {
 }
 
 
+# A translation backend that keeps failing is not going to recover on the next
+# file, and grinding through the whole queue only burns time and API quota.
+# This many batches lost in a row (a success anywhere resets the count) stops
+# the run and tells the user.
+_TRANSLATION_FAILURE_LIMIT = 3
+
+
 class PipelineWorker(QObject):
     log = Signal(str)
+    # Raised when the run stops itself: one string, shown as a modal dialog.
+    alert = Signal(str)
     # (overall_percent, file_percent, row_index, label_index, stage_label)
     #
     # row_index is the queue row whose bar just moved; label_index is the file
@@ -412,6 +421,10 @@ class PipelineWorker(QObject):
         # translation report on an earlier file cannot steal the status line.
         self._active_index = -1
         self._active_stage = "transcribing"
+        # Consecutive lost translation batches; cleared by any batch that
+        # completes. Reaching the limit aborts the run (see _note_error).
+        self._translation_error_streak = 0
+        self._alerted = False
 
     # ------------------------------------------------------------------
     # Progress bookkeeping
@@ -517,8 +530,37 @@ class PipelineWorker(QObject):
             source_lang=source_lang,
             swap_subtitles=self.config.swap_subtitles,
             progress_callback=(
-                lambda fraction: self._translate_progress(media_path, fraction)
+                lambda fraction: self._translation_progressed(media_path, fraction)
             ),
+            on_batch_error=self._note_translation_error,
+        )
+
+    def _translation_progressed(self, media_path: Path, fraction: float) -> None:
+        """A finished batch: the backend is answering again."""
+        self._translation_error_streak = 0
+        self._translate_progress(media_path, fraction)
+
+    def _note_translation_error(self, exc: BaseException) -> None:
+        """Count lost batches and stop the run when the backend is broken."""
+        self._translation_error_streak += 1
+        if self._alerted:
+            return
+        if self._translation_error_streak < _TRANSLATION_FAILURE_LIMIT:
+            return
+
+        self._alerted = True
+        self.cancel_event.set()
+        reason = str(exc).splitlines()[0][:200] if str(exc).strip() else exc.__class__.__name__
+        self.log.emit(
+            f"错误: 翻译后端连续失败 {self._translation_error_streak} 次，"
+            "已停止后续任务（网络或服务端问题）"
+        )
+        self.alert.emit(
+            "翻译连续失败，已停止本次任务。\n\n"
+            f"连续 {self._translation_error_streak} 个批次失败，最后一次错误：\n"
+            f"{reason}\n\n"
+            "常见原因：网络/代理不通、翻译服务端超时（504/502）。\n"
+            "已生成的字幕都保留着，排查后重新点「开始」即可只补翻译，不会重新识别音频。"
         )
 
     def _provider(self):
@@ -547,7 +589,11 @@ class PipelineWorker(QObject):
 
             media_path, srt_path, source_lang = task
             if self.cancel_event.is_set():
-                self.file_status.emit(str(media_path), "等待翻译")
+                # "已停止" when the run aborted itself: these files will not be
+                # picked up again, and "等待翻译" would promise exactly that.
+                self.file_status.emit(
+                    str(media_path), "已停止" if self._alerted else "等待翻译"
+                )
                 results.put((media_path, "deferred", ""))
                 continue
 
@@ -656,6 +702,14 @@ class PipelineWorker(QObject):
                         srt_path = self.config.output_dir / f"{media_path.stem}.srt"
                     else:
                         srt_path = media_path.with_suffix(".srt")
+                    # Subtitles are already on disk (a previous run wrote them
+                    # and its translation failed, or the file was dropped in
+                    # as a .srt): translate that file instead of transcribing
+                    # the media a second time.
+                    if status != "direct_srt":
+                        self.log.emit(
+                            f"已有字幕，跳过转写直接翻译: {srt_path.name}"
+                        )
                     self.file_status.emit(str(media_path), "等待翻译")
                     if llm_mode:
                         llm_pending.append((media_path, srt_path, self.config.language))
@@ -799,9 +853,10 @@ class PipelineWorker(QObject):
                         config=TranslateConfig.for_local_llm(),
                         progress_callback=(
                             lambda fraction, _path=media_path: (
-                                self._translate_progress(_path, fraction)
+                                self._translation_progressed(_path, fraction)
                             )
                         ),
+                        on_batch_error=self._note_translation_error,
                     )
                 except Exception as exc:
                     self.file_status.emit(str(media_path), "翻译失败")
@@ -929,10 +984,37 @@ class AsrWindow(QMainWindow):
         badge = QLabel("LOCAL · GPU")
         badge.setObjectName("badge")
 
+        # SRT → TXT/MD is a pure text job with no GPU and no model load, so it
+        # gets its own window instead of a checkbox in the transcription flow.
+        self.convert_button = QPushButton("字幕转文本")
+        self.convert_button.setObjectName("ghost")
+        self.convert_button.setToolTip("把已有 SRT 导出为纯文本或 Markdown")
+        self.convert_button.clicked.connect(self._open_converter_window)
+        self._converter_window = None
+
         layout.addLayout(text_box)
         layout.addStretch()
+        layout.addWidget(self.convert_button, alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         layout.addWidget(badge, alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         return header
+
+    def _open_converter_window(self) -> None:
+        """Open (or re-focus) the standalone SRT → TXT/MD window."""
+        from src.srt_convert_gui import ConvertWindow
+
+        if self._converter_window is None:
+            # Imported lazily: the converter is a separate tool, and a user who
+            # only transcribes should not pay for loading it.
+            self._converter_window = ConvertWindow()
+            self._converter_window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+            self._converter_window.destroyed.connect(self._on_converter_window_destroyed)
+        self._converter_window.show()
+        self._converter_window.raise_()
+        self._converter_window.activateWindow()
+
+    def _on_converter_window_destroyed(self) -> None:
+        """Drop the reference so a later click builds a fresh window."""
+        self._converter_window = None
 
     def _build_left_panel(self) -> QWidget:
         """The one raised surface: intake, queue, and the log strip."""
@@ -1967,6 +2049,7 @@ class AsrWindow(QMainWindow):
         self._worker.log.connect(self._append_log)
         self._worker.progress.connect(self._update_progress)
         self._worker.file_status.connect(self._update_file_status)
+        self._worker.alert.connect(self._show_alert)
         self._worker.finished.connect(self._worker_finished)
         self._worker.finished.connect(self._worker.deleteLater)
         self._worker.finished.connect(self._thread.quit)
@@ -1979,6 +2062,11 @@ class AsrWindow(QMainWindow):
         self.stop_button.setEnabled(False)
         self.progress_label.setText("正在停止，等待当前任务结束...")
         self._append_log("警告: 用户请求停止，等待当前任务完成...")
+
+    def _show_alert(self, message: str) -> None:
+        """Run-stopping failure: say so loudly, not only in the log pane."""
+        self.progress_label.setText("已停止：翻译连续失败")
+        QMessageBox.critical(self, "翻译失败，已停止", message)
 
     def _set_running(self, running: bool) -> None:
         self._is_running = running

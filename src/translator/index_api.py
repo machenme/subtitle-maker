@@ -20,11 +20,12 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from typing import Any
 
 import requests
 
-from src.translator.types import TranslationError
+from src.translator.types import TransientTranslationError, TranslationError
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,20 @@ _DEFAULT_BASE_URL = "https://index-translate.bilibili.com/v1"
 _DEFAULT_MODEL = "Index-Translate-35B-A3B"
 _DEFAULT_API_KEY = "EMPTY"
 _DEFAULT_TIMEOUT = 120
+
+# The public endpoint is a free shared service behind openresty: individual
+# requests intermittently come back as gateway timeouts (504) or upstream
+# errors (502/503) and succeed unchanged on the next try. Retrying is the
+# difference between a transient blip and losing a whole subtitle file.
+#
+# Two attempts at the original size, then the request is cut in half — a
+# retry that hangs the full budget twice costs more than a smaller request.
+_DEFAULT_RETRIES = 2
+_DEFAULT_BACKOFF = 2.0
+# A retry runs against a server that just failed to answer in time, so give it
+# less rope: waiting the full budget again only delays the fallback.
+_DEFAULT_RETRY_TIMEOUT = 60
+_TRANSIENT_STATUS = frozenset({408, 429, 500, 502, 503, 504})
 
 # The public endpoint sits behind a WAF that rejects requests without a
 # browser-like User-Agent (HTTP 412). Sending the stdlib default is enough to
@@ -129,6 +144,9 @@ class IndexApiTranslator:
         api_key: str = _DEFAULT_API_KEY,
         timeout: int = _DEFAULT_TIMEOUT,
         batch_size: int = _MAX_PACKED_LINES,
+        retries: int = _DEFAULT_RETRIES,
+        retry_backoff: float = _DEFAULT_BACKOFF,
+        retry_timeout: int = _DEFAULT_RETRY_TIMEOUT,
     ) -> None:
         self.proxy = _normalize_proxy(proxy)
         self.base_url = base_url.rstrip("/")
@@ -136,6 +154,9 @@ class IndexApiTranslator:
         self.api_key = api_key or _DEFAULT_API_KEY
         self.timeout = timeout
         self.batch_size = max(1, batch_size)
+        self.retries = max(1, retries)
+        self.retry_backoff = max(0.0, retry_backoff)
+        self.retry_timeout = max(1, retry_timeout)
         self._session = requests.Session()
         # Reuse connections across batches; the local Bing backend already
         # follows this pattern (a session per request cannot pool sockets).
@@ -217,6 +238,8 @@ class IndexApiTranslator:
         texts: list[str],
         results: list[str],
         target_name: str,
+        *,
+        allow_split: bool = True,
     ) -> None:
         """One packed request, splitting in half when numbers go missing."""
         if len(group) == 1:
@@ -232,9 +255,30 @@ class IndexApiTranslator:
             _LINE_TEMPLATE.format(number=n + 1, text=texts[i])
             for n, i in enumerate(group)
         )
-        translated = self._complete(
-            _MULTI_PROMPT_TEMPLATE.format(target_name=target_name, text=packed)
-        )
+        try:
+            translated = self._complete(
+                _MULTI_PROMPT_TEMPLATE.format(target_name=target_name, text=packed)
+            )
+        except TransientTranslationError:
+            # A gateway timeout usually means this request was too big for the
+            # server to finish in time. Retrying it verbatim already happened
+            # inside _complete; the next best move is a smaller request.
+            if not allow_split:
+                raise
+            middle = len(group) // 2
+            logger.warning(
+                "Index API failed %d packed line(s) after %d attempt(s); "
+                "splitting into %d + %d",
+                len(group), self.retries, middle, len(group) - middle,
+            )
+            self._translate_packed(
+                group[:middle], texts, results, target_name, allow_split=False
+            )
+            self._translate_packed(
+                group[middle:], texts, results, target_name, allow_split=False
+            )
+            return
+
         parsed = _parse_numbered_lines(translated, len(group))
         if parsed is not None:
             for n, index in enumerate(group):
@@ -250,6 +294,27 @@ class IndexApiTranslator:
         self._translate_packed(group[middle:], texts, results, target_name)
 
     def _complete(self, prompt: str) -> str:
+        """Send one chat completion, retrying transient gateway failures."""
+        last_error: TranslationError | None = None
+        for attempt in range(1, self.retries + 1):
+            try:
+                return self._request(
+                    prompt,
+                    self.timeout if attempt == 1 else self.retry_timeout,
+                )
+            except TransientTranslationError as exc:
+                last_error = exc
+                if attempt >= self.retries:
+                    break
+                delay = self.retry_backoff * attempt
+                logger.warning(
+                    "Index API attempt %d/%d failed (%s); retrying in %.1fs",
+                    attempt, self.retries, exc, delay,
+                )
+                time.sleep(delay)
+        raise last_error  # type: ignore[misc]  # loop always sets it before break
+
+    def _request(self, prompt: str, timeout: int) -> str:
         """Send one chat completion and return the cleaned translation."""
         payload: dict[str, Any] = {
             "model": self.model,
@@ -265,10 +330,14 @@ class IndexApiTranslator:
                     "Content-Type": "application/json",
                     "Authorization": f"Bearer {self.api_key}",
                 },
-                timeout=self.timeout,
+                timeout=timeout,
             )
         except requests.RequestException as exc:
-            raise TranslationError(f"Index API request failed: {exc}") from exc
+            # Timeouts and connection resets are the same class of blip as a
+            # 504: the request may well never have been served.
+            raise TransientTranslationError(
+                f"Index API request failed: {exc}"
+            ) from exc
 
         if not response.ok:
             hint = ""
@@ -277,12 +346,16 @@ class IndexApiTranslator:
                     "（HTTP 412 通常是网络/WAF 拦截：确认已配置代理，"
                     "例如 translation_proxy: 127.0.0.1:7897）"
                 )
-            raise TranslationError(
+            message = (
                 f"Index API HTTP {response.status_code}{hint}: "
                 f"{response.text[:300]}"
             )
+            if response.status_code in _TRANSIENT_STATUS:
+                raise TransientTranslationError(message)
+            raise TranslationError(message)
+        data: Any = None
         try:
-            data: Any = response.json()
+            data = response.json()
             content = data["choices"][0]["message"]["content"]
         except (ValueError, IndexError, KeyError, TypeError) as exc:
             raise TranslationError(

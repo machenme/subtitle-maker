@@ -23,6 +23,7 @@ import time
 
 from src.config import PipelineConfig
 from src.translator import create_translator, translate_srt_with_outputs
+from src.translator.types import TranslationError
 from src.utils import scan_video_files
 from src.audio_extractor import (
     AudioExtractionCancelled,
@@ -34,6 +35,11 @@ from src.text_formatter import Segment, TextFormatter, set_cps_language
 from src.task_manager import TaskManager
 
 logger = logging.getLogger(__name__)
+
+# Consecutive translation failures that end the run. A backend that is down
+# (504s, DNS, a dead proxy) fails identically on every file, so finishing the
+# queue only spends more time to reach the same conclusion.
+_TRANSLATION_FAILURE_LIMIT = 3
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +359,77 @@ def _on_sigint(signum, frame):
     _shutdown_requested = True
 
 
+def _resume_translation(
+    config: PipelineConfig,
+    task,
+    source_lang: str,
+    translation_targets: list[tuple[Path, str]],
+) -> tuple[bool, int, str]:
+    """Handle a task whose subtitles exist but whose translation is missing.
+
+    The local-LLM backend translates in one deferred pass after all ASR work,
+    so here it is only queued; every other provider translates right away.
+    """
+    stem = task.video_path.stem
+    if config.translation_provider == "llm":
+        translation_targets.append((task.source_srt, source_lang))
+        logger.info(
+            "Resume: %s queued for the local-LLM translation pass", stem
+        )
+        return (True, 0, "")
+    if not source_lang or source_lang == "auto":
+        # Edge/Bing reject "auto"; say what to do instead of failing deep
+        # inside the provider with a message that names no file.
+        logger.warning(
+            "Resume: %s has subtitles but their source language is unknown — "
+            "set language in config.yaml to translate them", stem,
+        )
+    return run_translation_only(
+        config, task.video_path, task.source_srt, source_lang=source_lang
+    )
+
+
+def run_translation_only(
+    config: PipelineConfig,
+    video_path: Path,
+    srt_path: Path,
+    *,
+    source_lang: str = "auto",
+) -> tuple[bool, int, str]:
+    """
+    Translate an SRT that already exists, without transcribing the media again.
+
+    Used when a previous run produced subtitles but its translation failed:
+    re-running ASR would spend the same GPU minutes to write a file we already
+    have. The transcription is never touched, so this can be repeated as often
+    as the (flaky, network-based) translation backend needs.
+
+    Returns:
+        (success, cue_count, error_message)
+    """
+    from src.translator.parser import parse_srt
+
+    provider = create_translator(
+        config.translation_provider, proxy=config.translation_proxy
+    )
+    cue_count = len(parse_srt(srt_path))
+    logger.info(
+        "Translating existing subtitles: %s → %s (%d cue(s), no ASR)",
+        srt_path.name, config.translate_to, cue_count,
+    )
+    translate_srt_with_outputs(
+        srt_path,
+        config.translate_to,
+        provider=provider,
+        source_lang=source_lang or config.language,
+        swap_subtitles=config.swap_subtitles,
+    )
+    logger.info("✓ %s: translated from existing subtitles", video_path.stem)
+    # 0: these cues were transcribed by an earlier run, so they must not be
+    # counted as segments this run produced.
+    return (True, 0, "")
+
+
 def _run_llm_translation_pass(
     config: PipelineConfig,
     targets: list[tuple[Path, str]],
@@ -596,6 +673,9 @@ def main():
 
     total_segments = 0
     failed_count = 0
+    # Consecutive translation failures, and whether they stopped the run.
+    translation_failures = 0
+    stopped_for_translation = False
     start_time = time.time()
     # Filled by run_one_video: exactly the subtitles this run produced, each
     # paired with the language ASR detected for it.
@@ -605,22 +685,63 @@ def main():
         if _shutdown_requested:
             break
         task_mgr.mark_started(task.video_path)
+        # Source language ASR reports for this file; reused by a later
+        # translate-only run, which has no ASR of its own to detect it.
+        detected_language: str = ""
+        failure: BaseException | None = None
         try:
-            ok, seg_count, err = run_one_video(
-                config, task.video_path, translation_targets=translation_targets
-            )
+            if getattr(task, "mode", "full") == "translate_only" and task.source_srt:
+                source_lang = config.language
+                if not source_lang or source_lang == "auto":
+                    source_lang = task_mgr.language_for(task.video_path.stem)
+                ok, seg_count, err = _resume_translation(
+                    config, task, source_lang, translation_targets
+                )
+            else:
+                def _progress(stage, current, total):
+                    nonlocal detected_language
+                    if stage == "detected_language" and isinstance(current, str):
+                        detected_language = current
+
+                ok, seg_count, err = run_one_video(
+                    config,
+                    task.video_path,
+                    translation_targets=translation_targets,
+                    progress_callback=_progress,
+                )
         except Exception as exc:
             logger.exception("Unhandled pipeline error for %s", task.video_path.name)
             ok, seg_count, err = False, 0, str(exc)
+            failure = exc
+        if ok and detected_language:
+            task_mgr.set_language(task.video_path.stem, detected_language)
         if ok:
             task_mgr.mark_done(task.video_path)
             total_segments += seg_count
+            translation_failures = 0
         elif err.startswith("Cancelled"):
             # A user stop is not a media failure: keep the task retryable.
             logger.warning("%s: %s", task.video_path.name, err)
         else:
             task_mgr.mark_failed(task.video_path, err)
             failed_count += 1
+            # A translation backend that fails on one file will fail on the
+            # next one too; walking the rest of the queue only burns time.
+            # Media failures (bad audio, ffmpeg) are unrelated, so only
+            # translation errors accumulate.
+            if isinstance(failure, TranslationError):
+                translation_failures += 1
+                if translation_failures >= _TRANSLATION_FAILURE_LIMIT:
+                    stopped_for_translation = True
+                    logger.error(
+                        "Translation failed on %d file(s) in a row (%s); "
+                        "stopping the run. Subtitles already written are kept "
+                        "— re-run this command to translate them.",
+                        translation_failures, err.splitlines()[0][:200],
+                    )
+                    break
+            else:
+                translation_failures = 0
 
     # --- Stage 4: local-LLM translation pass (after ASR) ---
     # Run only when every video is transcribed, so the translation model can
@@ -644,8 +765,9 @@ def main():
 
     # --- Summary ---
     logger.info(
-        f"Pipeline complete in {elapsed:.1f}s | "
-        f"Tasks: {task_mgr.done_count}/{task_mgr.total_count} done"
+        ("Pipeline stopped after repeated translation failures" if stopped_for_translation
+         else f"Pipeline complete in {elapsed:.1f}s")
+        + f" | Tasks: {task_mgr.done_count}/{task_mgr.total_count} done"
         + (f", {failed_count} failed" if failed_count else "")
         + f" | Total segments: {total_segments}"
     )

@@ -15,6 +15,8 @@ Input covers common video containers plus `m4a`, `mp3`, `wav`, `flac`, `ogg`, `o
 - **Multi-stream GPU parallelism** — spawns independent processes, each holding a resident `WhisperModel`, probing the safe concurrency at startup
 - **Automatic long-video splitting** — audio longer than N minutes is cut into pieces, processed in parallel, then merged back with corrected timestamps
 - **Resumable** — a re-run skips already completed videos; progress persists in `.progress.json`
+- **Translation is retryable** — a failed translation never costs the transcription: subtitles stay on disk and the next run only translates. Occasional 504s/timeouts are retried, and a request that keeps timing out is split into smaller ones
+- **Stops on a broken backend** — when translation keeps failing (network down, dead proxy), the run stops and says so instead of grinding through the whole queue
 - **Readable subtitle segmentation** — SRT lines are split on punctuation and duration into short lines (2–7 s / line, ≤ 40 characters)
 - **Multiple outputs** — SRT (default) + TXT plain text + MD timeline, each optional
 - **Free translation** — Microsoft Edge Translator web endpoint, 14 languages, batched into PotPlayer-compatible subtitles
@@ -141,6 +143,38 @@ translate_srt('demo.srt', 'zh', provider=EdgeTranslator())
 "
 ```
 
+### SRT → TXT / Markdown
+
+Export an existing `.srt` to plain text or Markdown without transcribing
+anything — pure text handling, no model load, no VRAM.
+
+**GUI**: click "字幕转文本" in the main window's top right, or launch it alone:
+
+```bash
+uv run python -m src.srt_convert_gui
+```
+
+Drop in SRT files or a whole folder, tick the formats you want (TXT /
+Markdown), and press "开始转换".
+
+**Command line**:
+
+```bash
+# One file; writes .txt and .md next to the source by default
+uv run python -m src.srt_convert demo.srt
+
+# Pick the output folder and the format
+uv run python -m src.srt_convert demo.srt -o ./output -f md
+
+# Whole directory (recursive), plain text only
+uv run python -m src.srt_convert ./subs -o ./output -f txt
+```
+
+`--formats` accepts `txt` and `md`, both by default. TXT is continuous text
+with no timestamps; Markdown prefixes every line with `[HH:MM:SS]`. Both match
+exactly what the transcription pipeline writes for the same subtitles. A few
+damaged cues do not block the export — every readable line still comes through.
+
 ## CLI reference
 
 | Flag | Type | Default | Description |
@@ -236,6 +270,12 @@ uv run python -m src.main --input ./videos --output ./subtitles
 uv run python -m src.main --input ./videos --output ./subtitles --force
 ```
 
+A failed translation no longer costs the transcription: the subtitles are
+already on disk, so the next run only redoes the translation
+(`Resume: <name> already transcribed → translation only`). Re-run the same
+command as often as needed; the source language ASR detected is stored in
+`.progress.json` and reused by the translation-only run.
+
 ### Switching language
 
 ```bash
@@ -254,6 +294,8 @@ uv run python -m src.gui
 ```
 
 > Translation uses the Microsoft Edge Translator web endpoint — free and key-less. It produces `video.srt` (target language), `video.bilingual.srt` (bilingual) and `video.jpn.srt` / `video.eng.srt` (original).
+
+**When translation fails**: occasional timeouts/504s retry themselves (once, then the request is split in half). If three batches in a row fail, the GUI stops the remaining tasks and shows a dialog, and the CLI aborts with the reason — subtitles already written are kept, so after fixing the network/proxy just run again to pick up at the translation step.
 
 ## Pipeline architecture
 

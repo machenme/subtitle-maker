@@ -11,6 +11,7 @@ from pathlib import Path
 from src.translator.types import (
     SrtCue,
     TranslateConfig,
+    TransientTranslationError,
     TranslationError,
     TranslationProvider,
     iso_to_player_suffix,
@@ -38,6 +39,7 @@ def translate_srt(
     monolingual_output_path: str | Path | None = None,
     original_output_path: str | Path | None = None,
     progress_callback: callable | None = None,
+    on_batch_error: callable | None = None,
 ) -> Path:
     """
     Translate an SRT file end-to-end.
@@ -62,6 +64,10 @@ def translate_srt(
         original_output_path: Optional path for a copy of the source SRT.
         progress_callback: Optional ``(fraction: float) -> None`` invoked as
             batches complete, so a long subtitle file is not a silent wait.
+        on_batch_error: Optional ``(exception) -> None`` invoked with the
+            error just before a batch that failed every retry is raised. A UI
+            uses it to notice a provider that is failing over and over instead
+            of grinding through the rest of the queue.
 
     Returns:
         Path to the written bilingual SRT file.
@@ -102,36 +108,68 @@ def translate_srt(
         # between cues are preserved by translate_batch, not by response
         # newlines, which translation services may merge or rewrite.
         request_texts = [" ".join(texts[i].splitlines()) for i in indices]
-        try:
-            translate_batch = getattr(provider, "translate_batch", None)
-            if callable(translate_batch):
-                lines = list(translate_batch(request_texts, source_lang, target_lang))
-            else:
-                # Keep compatibility with simple providers that only expose
-                # translate(), while still guaranteeing one request/result per cue.
-                lines = [
-                    provider.translate(text, source_lang, target_lang)
-                    for text in request_texts
-                ]
+        attempts = cfg.batch_retries + 1
+        for attempt in range(1, attempts + 1):
+            try:
+                translate_batch = getattr(provider, "translate_batch", None)
+                if callable(translate_batch):
+                    lines = list(translate_batch(request_texts, source_lang, target_lang))
+                else:
+                    # Keep compatibility with simple providers that only expose
+                    # translate(), while still guaranteeing one request/result per cue.
+                    lines = [
+                        provider.translate(text, source_lang, target_lang)
+                        for text in request_texts
+                    ]
 
-            if len(lines) != len(indices):
-                raise TranslationError(
-                    f"Batch {batch_idx} returned {len(lines)} translations for "
-                    f"{len(indices)} cues; refusing to write misaligned subtitles"
+                if len(lines) != len(indices):
+                    raise TranslationError(
+                        f"Batch {batch_idx} returned {len(lines)} translations for "
+                        f"{len(indices)} cues; refusing to write misaligned subtitles"
+                    )
+                logger.info(
+                    "Translation batch %d/%d complete",
+                    batch_idx + 1,
+                    len(batches),
                 )
-            logger.info(
-                "Translation batch %d/%d complete",
-                batch_idx + 1,
-                len(batches),
-            )
-            return (batch_idx, [str(line) for line in lines])
-        except TranslationError:
-            logger.exception(
-                "Translation batch %d/%d failed",
-                batch_idx + 1,
-                len(batches),
-            )
-            raise
+                return (batch_idx, [str(line) for line in lines])
+            except TranslationError as exc:
+                # The provider already retried transient failures (and, where
+                # possible, split the request) before raising; repeating that
+                # at batch level only delays the run's abort.
+                if isinstance(exc, TransientTranslationError):
+                    logger.error(
+                        "Translation batch %d/%d failed (provider already "
+                        "retried): %s", batch_idx + 1, len(batches), exc,
+                    )
+                    if on_batch_error is not None:
+                        try:
+                            on_batch_error(exc)
+                        except Exception:
+                            logger.debug("Translation error callback failed", exc_info=True)
+                    raise
+                if attempt >= attempts:
+                    logger.exception(
+                        "Translation batch %d/%d failed",
+                        batch_idx + 1,
+                        len(batches),
+                    )
+                    if on_batch_error is not None:
+                        try:
+                            on_batch_error(exc)
+                        except Exception:
+                            logger.debug("Translation error callback failed", exc_info=True)
+                    raise
+                # A single flaky request must not cost the whole file: the
+                # provider already retried its own HTTP calls, so this is a
+                # second, coarser net (and the only one that also covers
+                # malformed responses).
+                delay = cfg.retry_delay * attempt
+                logger.warning(
+                    "Translation batch %d/%d failed; retry %d/%d in %.1fs",
+                    batch_idx + 1, len(batches), attempt, cfg.batch_retries, delay,
+                )
+                time.sleep(delay)
 
     start_time = time.time()
     results: dict[int, list[str]] = {}
@@ -246,6 +284,7 @@ def translate_srt_with_outputs(
     swap_subtitles: bool = True,
     config: TranslateConfig | None = None,
     progress_callback: callable | None = None,
+    on_batch_error: callable | None = None,
 ) -> tuple[Path, Path | None, Path | None]:
     """Translate an SRT using the project's standard output file layout.
 
@@ -265,6 +304,7 @@ def translate_srt_with_outputs(
             source_lang=source_lang,
             config=config,
             progress_callback=progress_callback,
+            on_batch_error=on_batch_error,
         )
         return translated_path, None, None
 
@@ -286,5 +326,6 @@ def translate_srt_with_outputs(
         monolingual_output_path=file_path,
         original_output_path=original_path,
         progress_callback=progress_callback,
+        on_batch_error=on_batch_error,
     )
     return translated_path, bilingual_path, original_path

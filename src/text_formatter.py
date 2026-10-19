@@ -56,6 +56,22 @@ def set_cps_language(lang: str) -> None:
     _cps_language = lang if lang in _CPS_BY_LANG or lang == "auto" else "ja"
 
 
+def get_cps_language() -> str:
+    """Current language code used by the join/CPS rules."""
+    return _cps_language
+
+
+def join_separator(text: str) -> str:
+    """
+    Separator to place between adjacent texts for *text*.
+
+    Latin scripts need a space; CJK text must not get one.  Exposed so
+    non-ASR callers (SRT import) follow the same rule as the pipeline
+    instead of guessing a separator themselves.
+    """
+    return " " if _is_english_text(text) else ""
+
+
 def _cps_for_lang(lang: str) -> int:
     """Return recommended CPS for *lang* (ISO 639-1)."""
     return _CPS_BY_LANG.get(lang, _DEFAULT_CPS)

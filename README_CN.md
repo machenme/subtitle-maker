@@ -15,6 +15,8 @@
 - **GPU 多路并行** — spawn 独立进程，每进程常驻一个 WhisperModel，启动时逐个试探可用并发
 - **长视频自动切割** — 超过 N 分钟的音频自动切成片段，多 Worker 并行处理，最后合并时间戳
 - **断点续跑** — 中断后重跑自动跳过已完成的视频，进度持久化到 `.progress.json`
+- **翻译可重来** — 翻译失败不连累转写：字幕留在磁盘上，重跑只补翻译；偶发 504/超时自动重试并拆小请求
+- **故障即停** — 翻译后端连续失败（如断网、代理失效）会停止后续任务并弹窗提示，不空耗整个队列
 - **字幕级切分** — SRT 输出按标点 + 时长切分为可读短句（2-7 秒 / 条，≤40 字）
 - **多种输出** — SRT 字幕（默认）+ TXT 纯文本 + MD 带时间轴，可选勾选
 - **免费翻译** — 基于 Microsoft Edge Translator Web 接口，14 种语言，按批次输出 PotPlayer 兼容字幕
@@ -146,6 +148,33 @@ translate_srt('demo.srt', 'zh', provider=EdgeTranslator())
 "
 ```
 
+### 字幕转 TXT / Markdown
+
+已有的 `.srt` 不用转写也能直接导出成纯文本或 Markdown——纯文本处理，不加载模型、不占显存。
+
+**图形界面**：主界面右上角点「字幕转文本」，或单独启动：
+
+```bash
+uv run python -m src.srt_convert_gui
+```
+
+拖入 SRT 文件或整个文件夹，勾选需要的格式（TXT / Markdown），点「开始转换」。
+
+**命令行**：
+
+```bash
+# 单个文件，默认同时输出 .txt 和 .md，写在 SRT 旁边
+uv run python -m src.srt_convert demo.srt
+
+# 指定输出目录和格式
+uv run python -m src.srt_convert demo.srt -o ./output -f md
+
+# 整个目录（递归），只要纯文本
+uv run python -m src.srt_convert ./subs -o ./output -f txt
+```
+
+`--formats` 可选 `txt` 和 `md`，默认两个都出。TXT 是无时间戳的连续正文，Markdown 每行带 `[时:分:秒]` 时间戳，与转写流程直接输出这两份文件时的格式完全一致。字幕里有几行损坏也不影响——能读的部分照常导出。
+
 ## 命令行参数
 
 | 参数 | 类型 | 默认值 | 说明 |
@@ -241,6 +270,11 @@ uv run python -m src.main --input ./videos --output ./subtitles
 uv run python -m src.main --input ./videos --output ./subtitles --force
 ```
 
+翻译失败不会连累转写：字幕已经生成，重跑时只补翻译，不再重新识别一遍音频
+（日志里会显示 `Resume: xxx already transcribed → translation only`）。
+同一条命令可以反复执行，直到翻译成功；ASR 检测到的源语言会记在
+`.progress.json` 里，供只翻译的那一次使用。
+
 ### 切换语言
 
 ```bash
@@ -259,6 +293,8 @@ uv run python -m src.gui
 ```
 
 > 翻译基于 Microsoft Edge Translator Web 接口，免费、无需 API Key。默认生成：`视频名.srt`（单语译文）、`视频名.bilingual.srt`（双语字幕）和 `视频名.jpn.srt` / `视频名.eng.srt`（原始字幕）。
+
+**翻译出错时**：偶发的超时/504 会自动重试（重发一次，仍失败就把请求拆小再试）。如果连续 3 个批次都失败，GUI 会停止后续任务并弹窗提示，CLI 会终止并打印原因——已生成的字幕都保留，排查网络/代理后重新运行即可只补翻译。
 
 ## 管线架构
 
@@ -350,6 +386,9 @@ subtitle-maker/
 ├── src/
 │   ├── gui.py                # PySide6 图形界面入口
 │   ├── main.py               # CLI 入口，流程编排，信号处理
+│   ├── srt_convert.py        # SRT → TXT/Markdown 转换核心 + CLI
+│   ├── srt_convert_gui.py    # SRT → TXT/Markdown 独立窗口
+│   ├── translate_gui.py      # 独立字幕翻译窗口
 │   ├── config.py            # YAML 配置加载 / CLI 覆盖 / 校验
 │   ├── audio_extractor.py   # Stage 1: ffmpeg 提取 + 切割 + 容错 fallback
 │   ├── gpu_scheduler.py     # Stage 2: spawn 多进程 + 信号量 GPU 调度

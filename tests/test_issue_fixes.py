@@ -520,7 +520,11 @@ def test_failed_translation_does_not_wait_forever(tmp_path: Path, monkeypatch):
     from src.translator.types import TranslateConfig
 
     monkeypatch.setattr(pipeline_module, "_FAILURE_DRAIN_TIMEOUT", 0.1)
-    cfg = TranslateConfig(max_workers=4, batch_size=1, request_delay=0)
+    # batch_retries=0: this test is about the abort path, and a retried batch
+    # would re-enter the provider and scramble its call-ordered script.
+    cfg = TranslateConfig(
+        max_workers=4, batch_size=1, request_delay=0, batch_retries=0
+    )
 
     class PartiallyHangingProvider:
         """First batch succeeds, second fails fast, third never answers."""
@@ -560,7 +564,10 @@ def test_in_flight_request_finishes_before_return(tmp_path: Path, monkeypatch):
     from src.translator.types import TranslateConfig
 
     monkeypatch.setattr(pipeline_module, "_FAILURE_DRAIN_TIMEOUT", 5.0)
-    cfg = TranslateConfig(max_workers=4, batch_size=1, request_delay=0)
+    # batch_retries=0: the provider script below keys off the call number.
+    cfg = TranslateConfig(
+        max_workers=4, batch_size=1, request_delay=0, batch_retries=0
+    )
     finished: list[int] = []
 
     class SlowThenFailingProvider:

@@ -139,6 +139,33 @@ class Task:
     started_at: str | None = None
     finished_at: str | None = None
     fingerprint: dict | None = None  # {size, mtime, head_hash} at completion
+    # "full" = transcribe then translate. "translate_only" = the source SRT is
+    # already on disk (a previous run transcribed it and, typically, its
+    # translation failed), so only the translation step is left to do.
+    mode: str = "full"
+    source_srt: Path | None = None  # the SRT to translate when mode is translate_only
+
+
+def existing_source_srt(video_path: Path, output_dir: Path) -> Path | None:
+    """Return an already-produced source SRT for *video_path*, or None.
+
+    Only the output directory is searched (flat, then the per-video
+    sub-directory layout): that is where this pipeline writes its ASR result,
+    so a hit there is a transcription we own and can safely re-translate. An
+    SRT sitting next to the media is left alone — it may be a translation
+    someone else produced, and translating it again would overwrite it.
+    Used to resume a file whose transcription succeeded but whose translation
+    did not, without re-running ASR.
+    """
+    stem = video_path.stem
+    candidates = [
+        Path(output_dir) / f"{stem}.srt",
+        Path(output_dir) / stem / f"{stem}.srt",
+    ]
+    for path in candidates:
+        if is_srt_valid(path):
+            return path
+    return None
 
 
 @dataclass
@@ -182,6 +209,10 @@ class TaskManager:
         self._translate_to = translate_to
         self._swap_subtitles = swap_subtitles
         self._source_lang = source_lang
+        # stem → source language Whisper detected. Remembered so a later
+        # translate-only run (no ASR, hence no detection) still knows what it
+        # is translating from — Edge/Bing refuse "auto".
+        self._languages: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Build work queue
@@ -218,11 +249,23 @@ class TaskManager:
                 if fp and self._verify_fingerprint(stem, fp):
                     task.status = "done"
                     logger.info(f"Skip (already done): {stem}")
-                else:
-                    logger.info(f"File changed, re-processing: {stem}")
-                    tasks.append(task)
-            else:
-                tasks.append(task)
+                    continue
+                logger.info(f"File changed, re-processing: {stem}")
+
+            # Subtitles exist but the translation does not: re-running the ASR
+            # would throw away minutes of GPU work to reproduce a file we
+            # already have, so this task only translates.
+            if not force and self._translate_to:
+                source_srt = existing_source_srt(vp, self._output_dir)
+                if source_srt is not None:
+                    task.mode = "translate_only"
+                    task.source_srt = source_srt
+                    logger.info(
+                        "Resume: %s already transcribed (%s) → translation only",
+                        stem, source_srt.name,
+                    )
+
+            tasks.append(task)
 
         return tasks
 
@@ -290,6 +333,7 @@ class TaskManager:
             "completed": completed,
             "failed": failed,
             "fingerprints": fingerprints,
+            "languages": dict(self._languages),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         try:
@@ -312,6 +356,11 @@ class TaskManager:
             fps = data.pop("fingerprints", {})
             if isinstance(fps, dict):
                 self._fingerprints.update(fps)
+            # Known key in newer snapshots; absent in files written by older
+            # versions, where translate-only runs simply fall back to config.
+            languages = data.pop("languages", {})
+            if isinstance(languages, dict):
+                self._languages.update(languages)
             return ProgressSnapshot(**data)
         except (json.JSONDecodeError, TypeError, KeyError, AttributeError) as exc:
             logger.warning(f"Progress file corrupted, ignoring: {exc}")
@@ -345,6 +394,15 @@ class TaskManager:
             self._tasks[stem].status = "done"
             self._tasks[stem].finished_at = datetime.now(timezone.utc).isoformat()
             self._tasks[stem].fingerprint = _file_fingerprint(video_path)
+
+    def set_language(self, stem: str, language: str) -> None:
+        """Remember the source language ASR detected for *stem*."""
+        if language and language != "auto":
+            self._languages[stem] = language
+
+    def language_for(self, stem: str) -> str:
+        """Last detected source language for *stem*, or "" when unknown."""
+        return self._languages.get(stem, "")
 
     def mark_failed(self, video_path: Path, error: str) -> None:
         stem = video_path.stem

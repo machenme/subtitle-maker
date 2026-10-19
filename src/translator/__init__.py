@@ -25,24 +25,51 @@ from src.translator.types import (
 )
 from src.translator.parser import parse_srt
 from src.translator.writer import write_bilingual_srt, write_translation_srt
-from src.translator.edge import EdgeTranslator
-from src.translator.gtx import GtxTranslator
-from src.translator.index_api import IndexApiTranslator
-from src.translator.llm import LlmTranslator
 from src.translator.pipeline import translate_srt, translate_srt_with_outputs
+
+# The backends pull in requests / llama_cpp. Importing them eagerly made every
+# consumer of the parser pay for them, including the offline SRT→TXT converter
+# (src.srt_convert), which needs no network at all. PEP 562 keeps
+# `from src.translator import EdgeTranslator` working while loading each backend
+# only when it is actually referenced.
+_LAZY_BACKENDS = {
+    "EdgeTranslator": "src.translator.edge",
+    "GtxTranslator": "src.translator.gtx",
+    "IndexApiTranslator": "src.translator.index_api",
+    "LlmTranslator": "src.translator.llm",
+}
+
+
+def __getattr__(name: str):
+    module_path = _LAZY_BACKENDS.get(name)
+    if module_path is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from importlib import import_module
+
+    value = getattr(import_module(module_path), name)
+    globals()[name] = value  # cache: only the first access pays the import
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(__all__)
 
 
 def create_translator(provider: str = "bing", *, proxy: str = ""):
     """Create the configured translation backend."""
     if provider == "bing":
+        from src.translator.edge import EdgeTranslator
         return EdgeTranslator()
     if provider == "gtx":
+        from src.translator.gtx import GtxTranslator
         return GtxTranslator(proxy=proxy)
     if provider == "index_api":
         # The public endpoint rejects requests without a proxy on networks
         # that cannot reach it directly; reuse the gtx proxy setting.
+        from src.translator.index_api import IndexApiTranslator
         return IndexApiTranslator(proxy=proxy)
     if provider == "llm":
+        from src.translator.llm import LlmTranslator
         return LlmTranslator()
     raise ValueError(f"Unknown translation provider: {provider}")
 
