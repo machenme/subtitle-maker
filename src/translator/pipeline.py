@@ -14,11 +14,11 @@ from src.translator.types import (
     TransientTranslationError,
     TranslationError,
     TranslationProvider,
+    bilingual_player_suffix,
     iso_to_player_suffix,
 )
 from src.translator.parser import parse_srt
 from src.translator.writer import write_bilingual_srt, write_translation_srt
-from src.utils import atomic_copy_file
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,6 @@ def translate_srt(
     config: TranslateConfig | None = None,
     output_path: str | Path | None = None,
     monolingual_output_path: str | Path | None = None,
-    original_output_path: str | Path | None = None,
     progress_callback: callable | None = None,
     on_batch_error: callable | None = None,
 ) -> Path:
@@ -49,7 +48,11 @@ def translate_srt(
     3. Concurrently translate each batch via *provider*, preserving one
        result per cue.
     4. Merge results back in original order.
-    5. Write bilingual SRT and optional translated-only/source copies.
+    5. Write bilingual SRT and the optional translated-only copy.
+
+    The source file is never modified: the video's default ``.srt`` stays in
+    its own language and every translation lands next to it under a language
+    tag players understand.
 
     Args:
         srt_path: Path to the source SRT.
@@ -58,10 +61,9 @@ def translate_srt(
         source_lang: ISO 639-1 source language (default ``"auto"``).
         config: Optional tuning overrides.
         output_path: Explicit output path.  Defaults to
-            ``{srt_stem}.{target_lang}.srt`` alongside the source. This is the
-            bilingual output.
+            ``{srt_stem}.bilingual.{target_lang}.srt`` alongside the source.
+            This is the bilingual output.
         monolingual_output_path: Optional path for the translated-only SRT.
-        original_output_path: Optional path for a copy of the source SRT.
         progress_callback: Optional ``(fraction: float) -> None`` invoked as
             batches complete, so a long subtitle file is not a silent wait.
         on_batch_error: Optional ``(exception) -> None`` invoked with the
@@ -259,12 +261,9 @@ def translate_srt(
             cues[cue_idx].translation = lines[j] if j < len(lines) else cues[cue_idx].text
 
     # --- 5. Write ---
-    suffix = iso_to_player_suffix(target_lang)
     out = Path(output_path) if output_path else file_path.with_stem(
-        f"{file_path.stem}.{suffix}"
+        f"{file_path.stem}.{bilingual_player_suffix(target_lang)}"
     )
-    if original_output_path:
-        atomic_copy_file(file_path, Path(original_output_path))
     write_bilingual_srt(cues, out)
     if monolingual_output_path:
         write_translation_srt(cues, monolingual_output_path)
@@ -281,51 +280,41 @@ def translate_srt_with_outputs(
     *,
     provider: TranslationProvider,
     source_lang: str = "auto",
-    swap_subtitles: bool = True,
     config: TranslateConfig | None = None,
     progress_callback: callable | None = None,
     on_batch_error: callable | None = None,
-) -> tuple[Path, Path | None, Path | None]:
-    """Translate an SRT using the project's standard output file layout.
+) -> tuple[Path, Path]:
+    """Translate an SRT using the project's PotPlayer-style output layout.
 
-    Returns ``(translated_or_bilingual, bilingual, original)``. The final two
-    paths are ``None`` when subtitle swapping is disabled.
+    The source file is left alone — it keeps being the video's default
+    subtitle — and two tagged files appear beside it::
+
+        movie.srt                  source language (default track, untouched)
+        movie.chs.srt              translated only
+        movie.bilingual.chs.srt    original line + translated line
+
+    Returns ``(translated, bilingual)``.
 
     ``config`` lets a caller override pipeline tunables; local-LLM callers
     should pass :meth:`TranslateConfig.for_local_llm` so batch size and rate
     limiting match the in-process model instead of the Bing defaults.
     """
     file_path = Path(srt_path)
-    if not swap_subtitles:
-        translated_path = translate_srt(
-            file_path,
-            target_lang,
-            provider=provider,
-            source_lang=source_lang,
-            config=config,
-            progress_callback=progress_callback,
-            on_batch_error=on_batch_error,
-        )
-        return translated_path, None, None
-
-    # Without ASR there is no detected language to name the copy after.
-    # "ja" used to be hardcoded here, which mislabelled every non-Japanese
-    # source; a neutral name states what the file is instead of guessing.
-    source_code = source_lang if source_lang and source_lang != "auto" else "original"
-    bilingual_path = file_path.with_stem(f"{file_path.stem}.bilingual")
-    original_path = file_path.with_stem(
-        f"{file_path.stem}.{iso_to_player_suffix(source_code)}"
+    translated_path = file_path.with_stem(
+        f"{file_path.stem}.{iso_to_player_suffix(target_lang)}"
     )
-    translated_path = translate_srt(
+    bilingual_path = file_path.with_stem(
+        f"{file_path.stem}.{bilingual_player_suffix(target_lang)}"
+    )
+    translate_srt(
         file_path,
         target_lang,
         provider=provider,
         source_lang=source_lang,
         config=config,
         output_path=bilingual_path,
-        monolingual_output_path=file_path,
-        original_output_path=original_path,
+        monolingual_output_path=translated_path,
         progress_callback=progress_callback,
         on_batch_error=on_batch_error,
     )
-    return translated_path, bilingual_path, original_path
+    return translated_path, bilingual_path

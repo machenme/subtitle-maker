@@ -73,8 +73,6 @@ def test_build_queue_translates_instead_of_transcribing_again(tmp_path: Path):
         out,
         output_formats=["srt"],
         translate_to="zh",
-        swap_subtitles=True,
-        source_lang="auto",
     )
     tasks = manager.build_queue([video])
 
@@ -98,7 +96,6 @@ def test_failed_translation_resumes_as_translation_only(
         translate_to="zh",
         translation_provider="index_api",
         translation_proxy="",
-        swap_subtitles=True,
         language="ja",
     )
 
@@ -106,8 +103,6 @@ def test_failed_translation_resumes_as_translation_only(
         out,
         output_formats=["srt"],
         translate_to="zh",
-        swap_subtitles=True,
-        source_lang="auto",
     )
     tasks = manager.build_queue([video])
     assert tasks[0].mode == "translate_only"
@@ -124,8 +119,6 @@ def test_failed_translation_resumes_as_translation_only(
         out,
         output_formats=["srt"],
         translate_to="zh",
-        swap_subtitles=True,
-        source_lang="auto",
     ).build_queue([video]) == []
 
 
@@ -138,8 +131,6 @@ def test_build_queue_transcribes_when_there_are_no_subtitles(tmp_path: Path):
         out,
         output_formats=["srt"],
         translate_to="zh",
-        swap_subtitles=True,
-        source_lang="auto",
     )
     tasks = manager.build_queue([video])
 
@@ -163,7 +154,6 @@ def test_run_translation_only_writes_outputs_without_asr(
         translate_to="zh",
         translation_provider="index_api",
         translation_proxy="",
-        swap_subtitles=True,
         language="ja",
     )
 
@@ -172,10 +162,11 @@ def test_run_translation_only_writes_outputs_without_asr(
     )
 
     assert (ok, segments, error) == (True, 0, "")
-    # Swapped layout: the .srt now carries the translation, the source is kept.
-    assert "译文:第一条原文" in srt_path.read_text(encoding="utf-8")
-    assert (out / "clip.bilingual.srt").exists()
-    assert "第一条原文" in (out / "clip.jpn.srt").read_text(encoding="utf-8")
+    # PotPlayer layout: the .srt stays the source, translations are tagged.
+    assert "第一条原文" in srt_path.read_text(encoding="utf-8")
+    assert (out / "clip.chs.srt").exists()
+    assert "译文:第一条原文" in (out / "clip.chs.srt").read_text(encoding="utf-8")
+    assert (out / "clip.bilingual.chs.srt").exists()
 
 
 def test_detected_language_is_remembered_for_later_runs(tmp_path: Path):

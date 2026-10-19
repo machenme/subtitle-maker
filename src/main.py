@@ -305,25 +305,19 @@ def run_one_video(
                 config.translation_provider,
                 proxy=config.translation_proxy,
             )
-            translated_path, bilingual_path, original_path = translate_srt_with_outputs(
+            translated_path, bilingual_path = translate_srt_with_outputs(
                 srt_path,
                 config.translate_to,
                 provider=provider,
                 source_lang=detected_language,
-                swap_subtitles=config.swap_subtitles,
             )
-            written.extend(
-                [translated_path, original_path]
-                if config.swap_subtitles and original_path
-                else [translated_path]
+            written.extend([translated_path, bilingual_path])
+            logger.info(
+                "Subtitle outputs: %s (source/default), %s (translated), %s (bilingual)",
+                srt_path.name,
+                translated_path.name,
+                bilingual_path.name,
             )
-            if config.swap_subtitles:
-                logger.info(
-                    "Subtitle outputs: %s (translated), %s (bilingual), %s (original)",
-                    srt_path.name,
-                    bilingual_path.name if bilingual_path else "",
-                    original_path.name if original_path else "",
-                )
     except Exception:
         if config.cleanup_temp:
             _cleanup_temp_audio(wav_path)
@@ -422,7 +416,6 @@ def run_translation_only(
         config.translate_to,
         provider=provider,
         source_lang=source_lang or config.language,
-        swap_subtitles=config.swap_subtitles,
     )
     logger.info("✓ %s: translated from existing subtitles", video_path.stem)
     # 0: these cues were transcribed by an earlier run, so they must not be
@@ -502,7 +495,6 @@ def _run_llm_translation_pass(
                     config.translate_to,
                     provider=provider,
                     source_lang=language or config.language,
-                    swap_subtitles=config.swap_subtitles,
                 )
             except Exception as exc:
                 failed += 1
@@ -519,19 +511,19 @@ def _run_llm_translation_pass(
 
 
 def _translation_outputs_present(config: PipelineConfig, srt_path: Path) -> bool:
-    """True when this SRT already has the translation outputs enabled by config."""
+    """True when this SRT already has both translations written next to it."""
+    from src.translator.types import bilingual_player_suffix, iso_to_player_suffix
     from src.utils import is_srt_valid
 
     if not is_srt_valid(srt_path):
         return False
-    if not config.swap_subtitles:
-        from src.translator.types import iso_to_player_suffix
-
-        target = srt_path.with_stem(
-            f"{srt_path.stem}.{iso_to_player_suffix(config.translate_to)}"
-        )
-        return is_srt_valid(target)
-    return is_srt_valid(srt_path.with_stem(f"{srt_path.stem}.bilingual"))
+    translated = srt_path.with_stem(
+        f"{srt_path.stem}.{iso_to_player_suffix(config.translate_to)}"
+    )
+    bilingual = srt_path.with_stem(
+        f"{srt_path.stem}.{bilingual_player_suffix(config.translate_to)}"
+    )
+    return is_srt_valid(translated) and is_srt_valid(bilingual)
 
 
 def _exit_code(*, failed_count: int, done_count: int, interrupted: bool) -> int:
@@ -661,8 +653,6 @@ def main():
         config.output_dir,
         output_formats=config.output_formats,
         translate_to=config.translate_to,
-        swap_subtitles=config.swap_subtitles,
-        source_lang=config.language,
     )
     tasks = task_mgr.build_queue(video_paths, force=cli.force)
     if not tasks:

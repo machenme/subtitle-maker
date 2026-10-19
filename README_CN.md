@@ -20,8 +20,8 @@
 - **字幕级切分** — SRT 输出按标点 + 时长切分为可读短句（2-7 秒 / 条，≤40 字）
 - **多种输出** — SRT 字幕（默认）+ TXT 纯文本 + MD 带时间轴，可选勾选
 - **免费翻译** — 基于 Microsoft Edge Translator Web 接口，14 种语言，按批次输出 PotPlayer 兼容字幕
-- **智能跳过** — 导入视频自动检测同名 `.srt` / `.bilingual.srt` / 源语言字幕，已翻译的直接跳过，有字幕的只翻译不转写
-- **三份字幕输出** — 默认生成同名单语译文 `.srt`、`.bilingual.srt` 双语字幕和带源语言后缀的原始字幕
+- **智能跳过** — 导入视频自动检测同名 `.srt` 与译文/双语字幕，已翻译的直接跳过，有字幕的只翻译不转写
+- **PotPlayer 字幕命名** — 视频同名 `.srt` 始终是源语言默认字幕，译文写 `视频名.chs.srt`，双语写 `视频名.bilingual.chs.srt`
 - **SRT 直翻** — 已有 SRT 文件拖入即翻，跳过转写，秒级出结果
 - **每视频清理** — 处理完立即删除临时音频，不堆积 GB 级 temp 文件
 - **本地 ASR** — ASR 模型本地加载；启用翻译时，字幕文本会按批次发送到 Microsoft Edge Translator Web 接口
@@ -104,13 +104,20 @@ uv run python -m src.gui
 
 1. 拖入音视频文件（或直接拖入已有的 `.srt` 字幕、整个文件夹）；有文件时拖放区会自动隐藏，之后把文件拖到队列表格任意位置即可继续添加
 2. 在"翻译为"下拉选择目标语言（如中文 chs）
-3. 点"开始转写" → 自动完成转写 + 翻译，默认输出单语译文、双语字幕和原始字幕
+3. 点"开始转写" → 自动完成转写 + 翻译，默认输出源语言字幕、单语译文和双语字幕
 
-> **智能检测**：导入视频时自动检查同目录是否已有三份字幕；三份齐全时直接跳过，有原文只翻译不转写。
+> **智能检测**：导入视频时自动检查同目录是否已有字幕；原文与两份译文齐全时直接跳过，有原文只翻译不转写。
 >
-> **三份字幕**：默认单语译文使用视频同名 `.srt`，双语字幕使用 `.bilingual.srt`，原始字幕使用源语言后缀（例如 `.jpn.srt`）。
+> **三份字幕**（PotPlayer 命名规范）：`视频名.srt` 是源语言原文，PotPlayer 默认加载它；`视频名.chs.srt` 是中文单语译文；`视频名.bilingual.chs.srt` 是双语（原文 + 译文）。三份互不覆盖，播放器里可随时切换轨道。
 >
 > **字幕直翻**：直接把 `.srt` 文件拖进窗口，选择翻译语言，点开始即可跳过转写、只做翻译。
+
+**从旧版本升级**：旧版本会把中文译文覆盖到 `视频名.srt`、把原文另存为 `视频名.jpn.srt`。迁移工具可以一次性把它们改回新命名（默认只预览，确认无误再加 `--apply`）：
+
+```bash
+uv run python -m tools.migrate_subtitle_names ./output          # 预览
+uv run python -m tools.migrate_subtitle_names ./output --apply  # 执行
+```
 
 ### 翻译接口
 
@@ -133,8 +140,9 @@ uv run python -m src.main --input ./videos --output ./output --translate zh
 
 # 输出结构：
 #   output/
-#   ├── demo1.srt             ← 中文双语字幕（译为主字幕）
-#   ├── demo1.jpn.srt         ← 原始日文字幕
+#   ├── demo1.srt                   ← 源语言字幕（视频默认字幕，PotPlayer 自动加载）
+#   ├── demo1.chs.srt               ← 中文单语译文
+#   ├── demo1.bilingual.chs.srt     ← 双语字幕（原文 + 中文）
 #   └── ...
 ```
 
@@ -237,7 +245,6 @@ video_extensions:                  # 扫描的音视频扩展名（兼容旧配�
 output_formats:                    # 输出格式（默认仅 SRT，可追加 txt / md）
   - srt
 translate_to: "zh"                 # 自动翻译目标语言（"" = 不翻译）
-swap_subtitles: true               # 生成单语译文、双语字幕和原始字幕
 
 cleanup_temp: true                 # 完成后清理临时文件
 ```
@@ -292,7 +299,7 @@ uv run python -m src.main --input ./videos --output ./out --translate zh
 uv run python -m src.gui
 ```
 
-> 翻译基于 Microsoft Edge Translator Web 接口，免费、无需 API Key。默认生成：`视频名.srt`（单语译文）、`视频名.bilingual.srt`（双语字幕）和 `视频名.jpn.srt` / `视频名.eng.srt`（原始字幕）。
+> 翻译基于 Microsoft Edge Translator Web 接口，免费、无需 API Key。默认生成：`视频名.srt`（源语言，播放器默认字幕）、`视频名.chs.srt`（中文单语译文）和 `视频名.bilingual.chs.srt`（双语字幕）。
 
 **翻译出错时**：偶发的超时/504 会自动重试（重发一次，仍失败就把请求拆小再试）。如果连续 3 个批次都失败，GUI 会停止后续任务并弹窗提示，CLI 会终止并打印原因——已生成的字幕都保留，排查网络/代理后重新运行即可只补翻译。
 

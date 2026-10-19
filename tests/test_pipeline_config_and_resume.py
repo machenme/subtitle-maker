@@ -103,12 +103,10 @@ def test_translation_defaults_to_chinese_and_requires_three_subtitles(tmp_path: 
         tmp_path / "output",
         output_formats=["srt"],
         translate_to="zh",
-        swap_subtitles=True,
-        source_lang="en",
     )
     assert manager._expected_output_names("movie") == [
-        "movie.bilingual.srt",
-        "movie.eng.srt",
+        "movie.bilingual.chs.srt",
+        "movie.chs.srt",
         "movie.srt",
     ]
 

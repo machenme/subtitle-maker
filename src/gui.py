@@ -80,6 +80,7 @@ from src.monitor import GpuMonitor
 from src.translator import (
     TranslateConfig,
     TranslationError,
+    bilingual_player_suffix,
     create_translator,
     iso_to_player_suffix,
     translate_srt,
@@ -480,8 +481,6 @@ class PipelineWorker(QObject):
     def check_existing_subs(
         media_path: Path,
         target_lang: str = "",
-        swap_subtitles: bool = True,
-        source_lang: str = "auto",
         output_dir: Path | None = None,
     ) -> str:
         source_base = media_path.with_suffix("")
@@ -494,19 +493,14 @@ class PipelineWorker(QObject):
                 return "done"
             return "translate" if is_srt_valid(media_path) else "asr"
         if target_lang:
-            target_path = Path(f"{base}.{iso_to_player_suffix(target_lang)}.srt")
-            if swap_subtitles:
-                required = (
-                    Path(f"{base}.srt"),
-                    Path(f"{base}.bilingual.srt"),
-                )
-                if source_lang != "auto":
-                    required += (
-                        Path(f"{base}.{iso_to_player_suffix(source_lang)}.srt"),
-                    )
-                if all(is_srt_valid(path) for path in required):
-                    return "done"
-            elif is_srt_valid(target_path):
+            # The untagged .srt is the video's default subtitle and stays in
+            # the source language; both tagged translations must exist for the
+            # video to count as done.
+            required = (
+                Path(f"{base}.{iso_to_player_suffix(target_lang)}.srt"),
+                Path(f"{base}.{bilingual_player_suffix(target_lang)}.srt"),
+            )
+            if all(is_srt_valid(path) for path in required):
                 return "done"
         if is_srt_valid(Path(f"{base}.srt")):
             if target_lang and base != source_base:
@@ -528,7 +522,6 @@ class PipelineWorker(QObject):
             self.config.translate_to,
             provider=provider,
             source_lang=source_lang,
-            swap_subtitles=self.config.swap_subtitles,
             progress_callback=(
                 lambda fraction: self._translation_progressed(media_path, fraction)
             ),
@@ -673,8 +666,6 @@ class PipelineWorker(QObject):
                     status = self.check_existing_subs(
                         media_path,
                         self.config.translate_to,
-                        self.config.swap_subtitles,
-                        self.config.language,
                         self.config.output_dir,
                     )
                 # The ASR/translation split depends on this, and it is decided
@@ -849,7 +840,6 @@ class PipelineWorker(QObject):
                         self.config.translate_to,
                         provider=provider,
                         source_lang=source_lang,
-                        swap_subtitles=self.config.swap_subtitles,
                         config=TranslateConfig.for_local_llm(),
                         progress_callback=(
                             lambda fraction, _path=media_path: (
@@ -1253,10 +1243,6 @@ class AsrWindow(QMainWindow):
                 "中文 (zh)",
             )
         )
-        self.swap_check = CheckBox("生成单语译文、双语字幕和原始字幕")
-        self.swap_check.setChecked(
-            self.config.swap_subtitles if self.config else True
-        )
         self.proxy_edit = QLineEdit(self.config.translation_proxy if self.config else "")
         self.proxy_edit.setPlaceholderText("127.0.0.1:7897")
         self.proxy_edit.setToolTip("Legacy GTX 必须使用代理，例如 127.0.0.1:7897")
@@ -1288,7 +1274,6 @@ class AsrWindow(QMainWindow):
             translate_grid, 3, "本地模型", llm_model_row
         )
         translate_layout.addLayout(translate_grid)
-        translate_layout.addWidget(inline(self.swap_check), 0, Qt.AlignmentFlag.AlignLeft)
         self.translator_combo.currentTextChanged.connect(self._on_translator_changed)
         self._update_gtx_controls()
         self.translate_card = translate_holder
@@ -1395,7 +1380,7 @@ class AsrWindow(QMainWindow):
             self.output_edit, self.model_combo, self.workers_spin, self.language_combo,
             self.beam_spin, self.chunk_combo, self.vad_check, self.srt_check,
             self.txt_check, self.md_check, self.translate_check, self.translator_combo, self.translate_combo,
-            self.proxy_edit, self.swap_check, self.advanced_toggle,
+            self.proxy_edit, self.advanced_toggle,
         ]
         for widget in (
             self.srt_check,
@@ -1612,8 +1597,6 @@ class AsrWindow(QMainWindow):
                 status = PipelineWorker.check_existing_subs(
                     path,
                     target_lang if translation_requested else "",
-                    self.swap_check.isChecked(),
-                    source_lang,
                     Path(self.output_edit.text()),
                 )
             self.file_status[str(path)] = status
@@ -1764,8 +1747,6 @@ class AsrWindow(QMainWindow):
             status = PipelineWorker.check_existing_subs(
                 path,
                 TRANSLATE_MAP[self.translate_combo.currentText()] if self._translation_requested() else "",
-                self.swap_check.isChecked(),
-                LANGUAGE_MAP[self.language_combo.currentText()],
                 Path(self.output_edit.text()),
             )
             status_text = {
@@ -1939,7 +1920,6 @@ class AsrWindow(QMainWindow):
         output_dir = Path(output_text) if output_text else (
             self.paths[0].parent if self.paths else Path(".")
         )
-        source_language = LANGUAGE_MAP[self.language_combo.currentText()]
         affected: list[str] = []
         for path in self.paths:
             if path.suffix.lower() == ".srt":
@@ -1948,8 +1928,6 @@ class AsrWindow(QMainWindow):
             status = PipelineWorker.check_existing_subs(
                 path,
                 translate_to,
-                self.swap_check.isChecked(),
-                source_language,
                 output_dir,
             )
             if status in ("translate", "translate_output"):
@@ -2016,7 +1994,6 @@ class AsrWindow(QMainWindow):
                 "translation_provider": translation_provider,
                 "translation_proxy": translation_proxy,
                 "translation_model_path": self.llm_model_edit.text().strip(),
-                "swap_subtitles": self.swap_check.isChecked(),
             })
         except Exception as exc:
             message = str(exc)

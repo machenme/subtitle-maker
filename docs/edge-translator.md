@@ -146,33 +146,32 @@ output_path = translate_srt(
 print(output_path)
 ```
 
-默认输出为同目录的双语字幕：`demo.chs.srt`。每条字幕的格式是原文在前、译文在后。
+默认输出为同目录的双语字幕：`demo.bilingual.chs.srt`。每条字幕的格式是原文在前、译文在后。
 
 若需要项目默认的三文件布局，使用 `translate_srt_with_outputs()`：
 
 ```python
 from src.translator import EdgeTranslator, translate_srt_with_outputs
 
-bilingual_path, bilingual_output, original_path = translate_srt_with_outputs(
+translated_path, bilingual_path = translate_srt_with_outputs(
     "demo.srt",
     "zh",
     provider=EdgeTranslator(),
     source_lang="ja",
-    swap_subtitles=True,
 )
 
-print(bilingual_path, bilingual_output, original_path)
+print(translated_path, bilingual_path)
 ```
 
-此函数返回 `(translated_or_bilingual, bilingual, original)`。在 `swap_subtitles=True` 时：
+此函数返回 `(translated, bilingual)`，命名遵循 PotPlayer 的语言后缀约定：
 
 | 文件 | 内容 |
 | --- | --- |
-| `demo.srt` | 单语译文；原文件会被覆盖。 |
-| `demo.bilingual.srt` | 双语字幕，原文后紧跟译文。 |
-| `demo.jpn.srt` | 原始日语字幕备份。 |
+| `demo.srt` | 源语言字幕，保持不动 —— 它是播放器默认加载的字幕轨道。 |
+| `demo.chs.srt` | 单语译文。 |
+| `demo.bilingual.chs.srt` | 双语字幕，原文后紧跟译文。 |
 
-当 `swap_subtitles=False` 时，只生成 `demo.chs.srt` 双语字幕，不覆盖 `demo.srt`，并且返回元组的后两个路径为 `None`。
+语言标记始终放在最后一段（`chs`），因此 PotPlayer 会把两份译文都识别为中文轨道。
 
 ### 6.2 CLI：转写后自动翻译
 
@@ -195,7 +194,6 @@ output_formats:
 translate_to: "zh"
 translation_provider: "bing"
 translation_proxy: ""
-swap_subtitles: true
 ```
 
 翻译必须启用 `srt` 输出。CLI 转写流程在 `config.language == "auto"` 时会将翻译源语言回退为 `ja`，以满足 Edge 的显式源语言要求。因此，非日语视频应显式传入实际源语言，例如 `--language en`；否则该回退会导致翻译语言不准确。
@@ -220,12 +218,11 @@ GUI 将该后端映射为 `bing`，并在开始前校验：Edge 后端且源语�
 from src.translator import create_translator, translate_srt_with_outputs
 
 provider = create_translator("bing")
-translated_path, bilingual_path, original_path = translate_srt_with_outputs(
+translated_path, bilingual_path = translate_srt_with_outputs(
     srt_path="demo.srt",
     target_lang="zh",
     provider=provider,
     source_lang="ja",
-    swap_subtitles=True,
 )
 ```
 
@@ -239,7 +236,7 @@ translated_path, bilingual_path, original_path = translate_srt_with_outputs(
 | HTTP 429 或日志出现 `rate-limited` | 接口限流。模块会自动退避重试；持续发生时降低任务频率，稍后重试。 |
 | `Invalid response format` | Edge Web 接口的返回格式不符合当前实现预期。保留日志并检查 `src/translator/edge.py` 中的解析逻辑是否仍匹配服务端响应。 |
 | 翻译后字幕错位 | 正常实现会拒绝条目数不一致的响应。若确实出现错位，应检查是否有绕过 `translate_srt()` 的自定义调用。 |
-| 原始 `.srt` 被覆盖 | `swap_subtitles=true` 时这是预期行为；原文副本保存为源语言播放器后缀，例如 `.jpn.srt`。如不希望覆盖，传入 `swap_subtitles=False`。 |
+| 找不到中文译文 | 译文不再覆盖 `.srt`：单语译文是 `视频名.chs.srt`，双语是 `视频名.bilingual.chs.srt`，`.srt` 仍是源语言原文。 |
 
 ## 8. 自动化测试覆盖
 

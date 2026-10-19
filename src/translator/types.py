@@ -166,3 +166,13 @@ PLAYER_LANG_SUFFIX: dict[str, str] = {
 def iso_to_player_suffix(iso: str) -> str:
     """ISO 639-1 code → PotPlayer-compatible suffix (e.g. ``"ja"`` → ``"jpn"``)."""
     return PLAYER_LANG_SUFFIX.get(iso, iso)
+
+
+def bilingual_player_suffix(iso: str) -> str:
+    """Suffix for the bilingual subtitle: ``"zh"`` → ``"bilingual.chs"``.
+
+    The language tag stays the last dot-separated part so players still read
+    the file as a track in that language; ``bilingual`` only disambiguates it
+    from the translated-only file sharing the same language tag.
+    """
+    return f"bilingual.{iso_to_player_suffix(iso)}"

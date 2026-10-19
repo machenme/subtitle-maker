@@ -163,12 +163,11 @@ def test_translate_checkbox_follows_config(app, tmp_path: Path, monkeypatch):
     """translate_to: "" must not show the translation box as enabled."""
     win = _window_with_config(
         app, tmp_path, monkeypatch,
-        **{"translate_to": '""', "swap_subtitles": "false"},
+        **{"translate_to": '""'},
     )
     try:
         assert win.config.translate_to == ""
         assert win.translate_check.isChecked() is False
-        assert win.swap_check.isChecked() is False
     finally:
         win._duration_probes.clear()
         win.close()
@@ -177,11 +176,10 @@ def test_translate_checkbox_follows_config(app, tmp_path: Path, monkeypatch):
 def test_translate_checkbox_enabled_when_config_translates(app, tmp_path: Path, monkeypatch):
     win = _window_with_config(
         app, tmp_path, monkeypatch,
-        **{"translate_to": '"zh"', "swap_subtitles": "true"},
+        **{"translate_to": '"zh"'},
     )
     try:
         assert win.translate_check.isChecked() is True
-        assert win.swap_check.isChecked() is True
     finally:
         win._duration_probes.clear()
         win.close()

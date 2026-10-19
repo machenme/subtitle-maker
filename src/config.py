@@ -119,7 +119,6 @@ class PipelineConfig:
     # one .gguf or the .gguf file itself; "" = use DEFAULT_TRANSLATION_MODEL_PATH.
     # Lets users point at their own quantized Index-Translate / Hy-MT2 build.
     translation_model_path: str = ""
-    swap_subtitles: bool = True  # write translated .srt, bilingual, and original subtitles
     cleanup_temp: bool = True
     verbose: bool = False
     # ffmpeg/ffprobe override: a file path or the folder holding the .exe.
@@ -232,9 +231,6 @@ class PipelineConfig:
             if cli.get("translation_model_path") is not None
             else raw.get("translation_model_path", "")
         )
-        swap_subtitles = _as_bool(
-            cli.get("swap_subtitles", raw.get("swap_subtitles", True)), True, "swap_subtitles"
-        )
         cleanup_temp = _as_bool(
             cli.get("cleanup_temp", raw.get("cleanup_temp", True)), True, "cleanup_temp"
         )
@@ -268,7 +264,6 @@ class PipelineConfig:
             translation_provider=translation_provider,
             translation_proxy=translation_proxy,
             translation_model_path=translation_model_path,
-            swap_subtitles=swap_subtitles,
             cleanup_temp=cleanup_temp,
             verbose=verbose,
             ffmpeg_path=str(ffmpeg_path),
@@ -356,7 +351,7 @@ class PipelineConfig:
         _string_list("video_extensions", self.video_extensions)
         _string_list("output_formats", self.output_formats)
 
-        for key in ("vad_filter", "swap_subtitles", "cleanup_temp", "verbose"):
+        for key in ("vad_filter", "cleanup_temp", "verbose"):
             if not isinstance(getattr(self, key), bool):
                 errors.append(
                     f"{key} must be a boolean, got {getattr(self, key)!r}"

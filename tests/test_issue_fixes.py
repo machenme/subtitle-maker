@@ -241,7 +241,7 @@ def test_llm_pass_only_translates_reported_targets(tmp_path: Path, monkeypatch):
     output_dir.mkdir()
     fresh = _valid_srt(output_dir / "fresh.srt")
     old = _valid_srt(output_dir / "old.srt")
-    _valid_srt(output_dir / "old.bilingual.srt")
+    _valid_srt(output_dir / "old.bilingual.chs.srt")
 
     translated: list[Path] = []
 
@@ -250,7 +250,7 @@ def test_llm_pass_only_translates_reported_targets(tmp_path: Path, monkeypatch):
         assert kwargs["source_lang"] == "en", (
             "the detected language must reach the translator, not the config"
         )
-        return (Path(srt_path), None, None)
+        return (Path(srt_path), None)
 
     import src.main as main_module
 
@@ -275,7 +275,6 @@ def test_llm_pass_only_translates_reported_targets(tmp_path: Path, monkeypatch):
     config = SimpleNamespace(
         output_dir=output_dir,
         translate_to="zh",
-        swap_subtitles=True,
         language="auto",
         translation_provider="llm",
     )
@@ -291,7 +290,8 @@ def test_llm_pass_skips_already_translated_subtitles(tmp_path: Path, monkeypatch
     output_dir = tmp_path / "output"
     output_dir.mkdir()
     done = _valid_srt(output_dir / "done.srt")
-    _valid_srt(output_dir / "done.bilingual.srt")
+    _valid_srt(output_dir / "done.chs.srt")
+    _valid_srt(output_dir / "done.bilingual.chs.srt")
 
     translated: list[Path] = []
     import src.main as main_module
@@ -317,7 +317,6 @@ def test_llm_pass_skips_already_translated_subtitles(tmp_path: Path, monkeypatch
     config = SimpleNamespace(
         output_dir=output_dir,
         translate_to="zh",
-        swap_subtitles=True,
         language="auto",
         translation_provider="llm",
     )
@@ -477,14 +476,14 @@ def test_null_max_workers_falls_back_to_the_default(tmp_path: Path):
 def test_quoted_boolean_is_coerced_not_truthy(tmp_path: Path):
     config_path = _write_config(
         tmp_path / "config.yaml",
-        'input_dir: "."\nvad_filter: "false"\nswap_subtitles: "no"\n'
+        'input_dir: "."\nvad_filter: "false"\ncleanup_temp: "no"\n'
         f'model_path: "{tmp_path.as_posix()}"\n',
     )
 
     config = PipelineConfig.build({"config": str(config_path)})
 
     assert config.vad_filter is False
-    assert config.swap_subtitles is False
+    assert config.cleanup_temp is False
 
 
 def test_non_boolean_flag_is_reported_with_its_key(tmp_path: Path):

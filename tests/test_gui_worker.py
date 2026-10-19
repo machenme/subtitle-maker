@@ -59,7 +59,6 @@ def _translation_config(tmp_path: Path) -> SimpleNamespace:
         translate_to="zh",
         output_dir=tmp_path,
         language="ja",
-        swap_subtitles=True,
         translation_provider="bing",
         translation_proxy="",
     )
@@ -72,13 +71,12 @@ def test_existing_subtitles_are_detected_in_custom_output_directory(tmp_path: Pa
     output_dir.mkdir()
     media_path.touch()
     content = "1\n00:00:00,000 --> 00:00:01,000\nA valid subtitle line for this test.\n"
-    for suffix in (".srt", ".bilingual.srt", ".jpn.srt"):
+    for suffix in (".srt", ".chs.srt", ".bilingual.chs.srt"):
         (output_dir / f"sample{suffix}").write_text(content, encoding="utf-8")
 
     assert PipelineWorker.check_existing_subs(
         media_path,
         target_lang="zh",
-        source_lang="ja",
         output_dir=output_dir,
     ) == "done"
 
@@ -118,7 +116,6 @@ def test_rerun_after_failed_translation_only_translates(tmp_path: Path, monkeypa
         translate_to="zh",
         output_dir=output_dir,
         language="ja",
-        swap_subtitles=True,
         translation_provider="index_api",
         translation_proxy="",
         translation_model_path="",
@@ -169,7 +166,6 @@ def _translation_failure_worker(tmp_path: Path, count: int):
         translate_to="zh",
         output_dir=output_dir,
         language="ja",
-        swap_subtitles=True,
         translation_provider="index_api",
         translation_proxy="",
         translation_model_path="",
@@ -297,17 +293,17 @@ def test_asr_continues_while_previous_subtitles_are_translating(tmp_path: Path, 
     assert summaries[0][0:3] == (2, 2, 0)
 
 
-def test_auto_source_language_does_not_require_original_suffix_for_resume(tmp_path: Path):
+def test_expected_outputs_are_source_plus_both_translations(tmp_path: Path):
+    """The default .srt is the source; both tagged translations must exist."""
     manager = TaskManager(
         tmp_path / "output",
         output_formats=["srt"],
         translate_to="zh",
-        swap_subtitles=True,
-        source_lang="auto",
     )
 
     assert manager._expected_output_names("movie") == [
-        "movie.bilingual.srt",
+        "movie.bilingual.chs.srt",
+        "movie.chs.srt",
         "movie.srt",
     ]
 
@@ -329,7 +325,7 @@ def test_translation_failure_does_not_block_later_asr_or_translation(tmp_path: P
     def fake_translate(srt_path, *_args, **_kwargs):
         if Path(srt_path) == existing_srt:
             raise TranslationError("provider unavailable")
-        return tmp_path / "fresh.bilingual.srt"
+        return tmp_path / "fresh.bilingual.chs.srt"
 
     monkeypatch.setattr("src.gui.run_one_video", fake_asr)
     monkeypatch.setattr("src.gui.translate_srt_with_outputs", fake_translate)
@@ -370,7 +366,7 @@ def test_stop_finishes_active_translation_and_leaves_pending_subtitles_queued(tm
         if path == first:
             translation_started.set()
             assert release_translation.wait(timeout=1)
-        return tmp_path / f"{path.stem}.bilingual.srt"
+        return tmp_path / f"{path.stem}.bilingual.chs.srt"
 
     monkeypatch.setattr("src.gui.translate_srt_with_outputs", fake_translate)
     monkeypatch.setattr("src.gui.create_translator", lambda *_args, **_kwargs: object())

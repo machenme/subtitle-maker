@@ -128,7 +128,7 @@ def test_pipeline_retries_a_failed_batch_instead_of_losing_the_file(tmp_path: Pa
         config=TranslateConfig(
             batch_size=50, max_workers=1, request_delay=0, retry_delay=0
         ),
-        output_path=tmp_path / "sample.bilingual.srt",
+        output_path=tmp_path / "sample.bilingual.chs.srt",
     )
 
     assert calls["n"] == 2
@@ -155,7 +155,7 @@ def test_pipeline_still_fails_when_every_retry_fails(tmp_path: Path):
                 batch_size=50, max_workers=1, request_delay=0, retry_delay=0,
                 batch_retries=1,
             ),
-            output_path=tmp_path / "sample.bilingual.srt",
+            output_path=tmp_path / "sample.bilingual.chs.srt",
         )
 
     assert provider.translate_batch.call_count == 2
@@ -183,7 +183,7 @@ def test_pipeline_does_not_retry_what_the_provider_already_retried(tmp_path: Pat
                 batch_size=50, max_workers=1, request_delay=0, retry_delay=0,
                 batch_retries=2,
             ),
-            output_path=tmp_path / "sample.bilingual.srt",
+            output_path=tmp_path / "sample.bilingual.chs.srt",
             on_batch_error=errors.append,
         )
 

@@ -25,9 +25,8 @@ def test_multiline_cues_do_not_shift_batch_alignment(tmp_path: Path):
     )
     provider = RecordingProvider()
 
-    bilingual = tmp_path / "sample.bilingual.srt"
-    translated = tmp_path / "sample.srt"
-    original = tmp_path / "sample.jpn.srt"
+    bilingual = tmp_path / "sample.bilingual.chs.srt"
+    translated = tmp_path / "sample.chs.srt"
     output = translate_srt(
         source,
         "zh",
@@ -35,7 +34,6 @@ def test_multiline_cues_do_not_shift_batch_alignment(tmp_path: Path):
         config=TranslateConfig(batch_size=50, max_workers=1, request_delay=0),
         output_path=bilingual,
         monolingual_output_path=translated,
-        original_output_path=original,
     )
 
     assert provider.requests == [["原文第一行 原文第二行", "第二条字幕"]]
@@ -46,37 +44,35 @@ def test_multiline_cues_do_not_shift_batch_alignment(tmp_path: Path):
         "1\n00:00:01,000 --> 00:00:03,000\n第一条\n\n"
         "2\n00:00:04,000 --> 00:00:06,000\n第二条\n"
     )
-    assert original.read_text(encoding="utf-8") == (
-        "1\n00:00:01,000 --> 00:00:03,000\n原文第一行\n原文第二行\n\n"
-        "2\n00:00:04,000 --> 00:00:06,000\n第二条字幕\n"
-    )
 
 
-def test_standard_output_layout_writes_translated_bilingual_and_original(tmp_path: Path):
+def test_standard_output_layout_keeps_source_and_writes_tagged_translations(tmp_path: Path):
+    """The default .srt stays the source language; translations are tagged."""
     source = tmp_path / "sample.srt"
-    source.write_text(
+    source_text = (
         "1\n00:00:01,000 --> 00:00:03,000\n原文第一条\n\n"
-        "2\n00:00:04,000 --> 00:00:06,000\n原文第二条\n",
-        encoding="utf-8",
+        "2\n00:00:04,000 --> 00:00:06,000\n原文第二条\n"
     )
+    source.write_text(source_text, encoding="utf-8")
 
-    translated, bilingual, original = translate_srt_with_outputs(
+    translated, bilingual = translate_srt_with_outputs(
         source,
         "zh",
         provider=RecordingProvider(),
         source_lang="ja",
     )
 
-    assert translated == tmp_path / "sample.bilingual.srt"
-    assert bilingual == translated
-    assert original == tmp_path / "sample.jpn.srt"
-    assert source.read_text(encoding="utf-8") == (
+    assert translated == tmp_path / "sample.chs.srt"
+    assert bilingual == tmp_path / "sample.bilingual.chs.srt"
+    # Source untouched: it stays the track PotPlayer loads by default.
+    assert source.read_text(encoding="utf-8") == source_text
+    assert translated.read_text(encoding="utf-8") == (
         "1\n00:00:01,000 --> 00:00:03,000\n第一条\n\n"
         "2\n00:00:04,000 --> 00:00:06,000\n第二条\n"
     )
-    assert original.read_text(encoding="utf-8") == (
-        "1\n00:00:01,000 --> 00:00:03,000\n原文第一条\n\n"
-        "2\n00:00:04,000 --> 00:00:06,000\n原文第二条\n"
+    assert bilingual.read_text(encoding="utf-8") == (
+        "1\n00:00:01,000 --> 00:00:03,000\n原文第一条\n第一条\n\n"
+        "2\n00:00:04,000 --> 00:00:06,000\n原文第二条\n第二条\n"
     )
 
 

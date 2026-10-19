@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from datetime import datetime, timezone
 
-from src.translator.types import iso_to_player_suffix
+from src.translator.types import bilingual_player_suffix, iso_to_player_suffix
 from src.utils import is_file_valid, is_srt_valid
 
 logger = logging.getLogger(__name__)
@@ -196,8 +196,6 @@ class TaskManager:
         *,
         output_formats: list[str] | None = None,
         translate_to: str = "",
-        swap_subtitles: bool = True,
-        source_lang: str = "auto",
     ):
         self._output_dir = Path(output_dir)
         self._output_dir.mkdir(parents=True, exist_ok=True)
@@ -207,8 +205,6 @@ class TaskManager:
         self._fingerprints: dict[str, dict] = {}  # stem → {size, mtime, head_hash}
         self._output_formats = set(output_formats or ["srt"])
         self._translate_to = translate_to
-        self._swap_subtitles = swap_subtitles
-        self._source_lang = source_lang
         # stem → source language Whisper detected. Remembered so a later
         # translate-only run (no ASR, hence no detection) still knows what it
         # is translating from — Edge/Bing refuse "auto".
@@ -287,18 +283,12 @@ class TaskManager:
     def _expected_output_names(self, stem: str) -> list[str]:
         names = [f"{stem}.{fmt}" for fmt in self._output_formats]
         if self._translate_to and "srt" in self._output_formats:
-            target_suffix = iso_to_player_suffix(self._translate_to)
-            if self._swap_subtitles:
-                names.extend([
-                    f"{stem}.srt",
-                    f"{stem}.bilingual.srt",
-                ])
-                if self._source_lang != "auto":
-                    names.append(
-                        f"{stem}.{iso_to_player_suffix(self._source_lang)}.srt"
-                    )
-            else:
-                names.append(f"{stem}.{target_suffix}.srt")
+            # The source .srt stays the video's default subtitle; a run is only
+            # complete once both language-tagged translations exist beside it.
+            names.extend([
+                f"{stem}.{iso_to_player_suffix(self._translate_to)}.srt",
+                f"{stem}.{bilingual_player_suffix(self._translate_to)}.srt",
+            ])
         return sorted(set(names))
 
     def _outputs_complete(self, stem: str, directory: Path) -> bool:

@@ -283,7 +283,7 @@ def test_overall_bar_never_resets_when_the_next_file_starts(qt_app, tmp_path, mo
         [first, second],
         {"one.mp4": "asr", "two.mp4": "asr"},
         _Config(
-            translate_to="", swap_subtitles=True, language="ja",
+            translate_to="", language="ja",
             translation_provider="bing", translation_proxy="",
             translation_model_path="", output_dir=tmp_path,
         ),
@@ -305,7 +305,7 @@ def test_bar_reaches_full_and_stays_there(qt_app, tmp_path, monkeypatch):
         [only],
         {"one.mp4": "asr"},
         _Config(
-            translate_to="", swap_subtitles=True, language="ja",
+            translate_to="", language="ja",
             translation_provider="bing", translation_proxy="",
             translation_model_path="", output_dir=tmp_path,
         ),
@@ -348,7 +348,7 @@ def test_translation_does_not_jump_the_bar_to_full_before_it_starts(
         release.wait(timeout=5)
         if progress_callback:
             progress_callback(1.0)
-        return tmp_path / "movie.bilingual.srt"
+        return tmp_path / "movie.bilingual.chs.srt"
 
     monkeypatch.setattr(gui_module, "translate_srt_with_outputs", slow_translate)
 
@@ -356,7 +356,7 @@ def test_translation_does_not_jump_the_bar_to_full_before_it_starts(
         [media],
         {"movie.m4a": "asr"},
         _Config(
-            translate_to="zh", swap_subtitles=True, language="ja",
+            translate_to="zh", language="ja",
             translation_provider="bing", translation_proxy="",
             translation_model_path="", output_dir=tmp_path,
         ),
@@ -472,7 +472,7 @@ def test_status_line_keeps_naming_the_asr_file_while_translation_reports(
         [first, second],
         {},
         _Config(
-            translate_to="zh", swap_subtitles=True, language="ja",
+            translate_to="zh", language="ja",
             translation_provider="bing", translation_proxy="",
             translation_model_path="", output_dir=tmp_path,
         ),

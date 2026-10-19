@@ -42,16 +42,12 @@ from PySide6.QtWidgets import (
 from src.translator import (
     TranslationError,
     create_translator,
-    iso_to_player_suffix,
-    parse_srt,
     translate_srt_with_outputs,
 )
 from src.ui_theme import (
     APP_STYLE,
-    CheckBox,
     ChevronComboBox,
     DropZone,
-    inline,
     panel,
     section,
     status_colors,
@@ -107,7 +103,6 @@ class TranslationWorker(QObject):
         backend: str,
         source_lang: str,
         target_lang: str,
-        swap_subtitles: bool,
         proxy: str,
         cancel_event: threading.Event,
     ):
@@ -116,7 +111,6 @@ class TranslationWorker(QObject):
         self.backend = backend
         self.source_lang = source_lang
         self.target_lang = target_lang
-        self.swap_subtitles = swap_subtitles
         self.proxy = proxy
         self.cancel_event = cancel_event
 
@@ -141,7 +135,6 @@ class TranslationWorker(QObject):
                     self.target_lang,
                     provider=provider,
                     source_lang=self.source_lang,
-                    swap_subtitles=self.swap_subtitles,
                 )
             except TranslationError as exc:
                 failed += 1
@@ -154,12 +147,10 @@ class TranslationWorker(QObject):
                 self.log.emit(f"翻译失败: {path.name} — {exc}")
             else:
                 done += 1
-                translated, bilingual, original = outputs
+                translated, bilingual = outputs
                 self.file_status.emit(str(path), "完成")
                 self.log.emit(f"已翻译: {path.name} → {translated.name}")
-                for extra in (bilingual, original):
-                    if extra:
-                        self.log.emit(f"  输出: {extra.name}")
+                self.log.emit(f"  输出: {bilingual.name}")
             self.progress.emit(index + 1, total)
 
         self.finished.emit(done, failed, self.cancel_event.is_set())
@@ -245,9 +236,6 @@ class TranslateWindow(QMainWindow):
         self.source_combo.setCurrentText("自动检测")
         self.target_combo = ChevronComboBox()
         self.target_combo.addItems(list(TARGET_LANGUAGE_MAP))
-        self.swap_check = CheckBox("生成单语译文、双语字幕和原始字幕")
-        self.swap_check.setChecked(True)
-
         for row, (label, widget) in enumerate((
             ("后端", self.backend_combo),
             ("源语言", self.source_combo),
@@ -259,9 +247,6 @@ class TranslateWindow(QMainWindow):
             grid.addWidget(caption, row, 0)
             grid.addWidget(widget, row, 1)
         layout.addLayout(grid)
-        # Without this the checkbox stretches to the full panel width, which
-        # reads as a selectable row instead of a checkbox.
-        layout.addWidget(inline(self.swap_check), 0, Qt.AlignmentFlag.AlignLeft)
         self.backend_combo.currentTextChanged.connect(self._on_backend_changed)
         return holder
 
@@ -368,7 +353,7 @@ class TranslateWindow(QMainWindow):
         layout.addLayout(row)
         self._settings_widgets = [
             self.backend_combo, self.source_combo, self.target_combo,
-            self.swap_check, self.add_button, self.remove_button, self.clear_button,
+            self.add_button, self.remove_button, self.clear_button,
         ]
         return bar
 
@@ -508,7 +493,6 @@ class TranslateWindow(QMainWindow):
             backend,
             source_lang,
             target_lang,
-            self.swap_check.isChecked(),
             "",  # proxy reserved for GTX extension
             self._cancel,
         )

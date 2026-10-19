@@ -21,6 +21,7 @@ from src.translator.types import (
     SrtCue,
     TranslateConfig,
     TranslationError,
+    bilingual_player_suffix,
     iso_to_player_suffix,
 )
 from src.translator.parser import parse_srt
@@ -82,6 +83,7 @@ __all__ = [
     "SrtCue",
     "TranslateConfig",
     "TranslationError",
+    "bilingual_player_suffix",
     "iso_to_player_suffix",
     "parse_srt",
     "translate_srt",

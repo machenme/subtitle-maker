@@ -20,8 +20,8 @@ Input covers common video containers plus `m4a`, `mp3`, `wav`, `flac`, `ogg`, `o
 - **Readable subtitle segmentation** — SRT lines are split on punctuation and duration into short lines (2–7 s / line, ≤ 40 characters)
 - **Multiple outputs** — SRT (default) + TXT plain text + MD timeline, each optional
 - **Free translation** — Microsoft Edge Translator web endpoint, 14 languages, batched into PotPlayer-compatible subtitles
-- **Smart skipping** — detects existing `.srt` / `.bilingual.srt` / source-language subtitles next to the video; already translated files are skipped, files with subtitles are translated only
-- **Three subtitle outputs** — by default it writes `name.srt` (target language), `name.bilingual.srt` (dual line) and `name.<source-lang>.srt` (original)
+- **Smart skipping** — detects existing `.srt` plus its translated/bilingual siblings next to the video; already translated files are skipped, files with subtitles are translated only
+- **PotPlayer subtitle naming** — `name.srt` always stays the source-language default track, the translation goes to `name.chs.srt` and the dual-line version to `name.bilingual.chs.srt`
 - **Direct SRT translation** — drop an existing `.srt` in and skip transcription entirely; results in seconds
 - **Per-video cleanup** — temporary audio is deleted right after each video, so GB-sized temp files never pile up
 - **Local ASR** — models load locally; when translation is enabled only subtitle text is sent out, batched, to the Microsoft Edge Translator endpoint
@@ -100,13 +100,20 @@ uv run python -m src.gui
 
 1. Drag in audio/video files (or an existing `.srt`, or a whole folder); the drop zone collapses once you have files, and you can keep dropping onto any part of the queue table
 2. Pick a target language in the "Translate to" dropdown (e.g. Chinese zh)
-3. Click **Start transcription** → transcription and translation run in one go, emitting the single-language, bilingual and original subtitles by default
+3. Click **Start transcription** → transcription and translation run in one go, emitting the source subtitle, the translated one and the bilingual one
 
-> **Smart detection:** existing subtitles next to the video are checked on import; when all three exist the video is skipped, when only the original exists it is translated without re-transcribing.
+> **Smart detection:** existing subtitles next to the video are checked on import; when the source plus both translations exist the video is skipped, when only the original exists it is translated without re-transcribing.
 >
-> **Three subtitles:** by default the target language uses `video.srt`, the bilingual version `video.bilingual.srt`, and the original `video.<source-lang>.srt` (e.g. `video.jpn.srt`).
+> **Three subtitles (PotPlayer naming):** `video.srt` is the source language and stays the default track a player loads automatically, `video.chs.srt` is the Chinese translation, `video.bilingual.chs.srt` is the dual-line version. None of them overwrite each other, so you can switch tracks in the player.
 >
 > **SRT-only translation:** drag an `.srt` file straight onto the window, pick a language and start — transcription is skipped.
+
+**Upgrading from an older version:** older releases wrote the Chinese translation over `video.srt` and kept the original as `video.jpn.srt`. The migration tool renames those back to the new layout (preview by default, add `--apply` once the plan looks right):
+
+```bash
+uv run python -m tools.migrate_subtitle_names ./output          # preview
+uv run python -m tools.migrate_subtitle_names ./output --apply  # rename
+```
 
 ### Translation backends
 
@@ -129,8 +136,9 @@ uv run python -m src.main --input ./videos --output ./output --translate zh
 
 # Output layout:
 #   output/
-#   ├── demo1.srt             ← Chinese subtitles (primary track)
-#   ├── demo1.jpn.srt         ← original Japanese subtitles
+#   ├── demo1.srt                   ← source-language subtitles (default track)
+#   ├── demo1.chs.srt               ← Chinese translation
+#   ├── demo1.bilingual.chs.srt     ← bilingual (source + Chinese)
 #   └── ...
 ```
 
@@ -237,7 +245,6 @@ video_extensions:                  # scanned media extensions
 output_formats:                    # output formats (SRT only by default, add txt / md)
   - srt
 translate_to: "zh"                 # translation target language ("" = disabled)
-swap_subtitles: true               # emit single-language, bilingual and original subtitles
 
 cleanup_temp: true                 # clean temp files when done
 ```
@@ -293,7 +300,7 @@ uv run python -m src.main --input ./videos --output ./out --translate zh
 uv run python -m src.gui
 ```
 
-> Translation uses the Microsoft Edge Translator web endpoint — free and key-less. It produces `video.srt` (target language), `video.bilingual.srt` (bilingual) and `video.jpn.srt` / `video.eng.srt` (original).
+> Translation uses the Microsoft Edge Translator web endpoint — free and key-less. It produces `video.srt` (source language, the player's default track), `video.chs.srt` (Chinese) and `video.bilingual.chs.srt` (bilingual).
 
 **When translation fails**: occasional timeouts/504s retry themselves (once, then the request is split in half). If three batches in a row fail, the GUI stops the remaining tasks and shows a dialog, and the CLI aborts with the reason — subtitles already written are kept, so after fixing the network/proxy just run again to pick up at the translation step.
 
